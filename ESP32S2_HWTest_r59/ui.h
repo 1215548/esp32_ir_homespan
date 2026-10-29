@@ -1,5 +1,5 @@
 //================================================================
-// ui.h - 屏幕绘制（r55 菜单版，深色卡片风）
+// ui.h - 屏幕绘制（r59 菜单版，深色卡片风）
 // 只负责把给定内容画到屏幕上，不含业务逻辑。
 //
 // 依赖（主文件须按此顺序准备好再 include 本文件）：
@@ -266,7 +266,7 @@ void bootAnimation() {
   const char *title = "ESP32-S2-IR";
   int16_t tw = cnTextWidth(title, 2);
   printCN((TFT_W - tw) / 2, 100, title, ST77XX_WHITE, UI_BG, 2);
-  const char *sub = "硬件测试 r55";
+  const char *sub = "硬件测试 r59";
   int16_t sw = cnTextWidth(sub, 1);
   printCN((TFT_W - sw) / 2, 150, sub, UI_MUTED, UI_BG, 1);
   tft.drawRoundRect(40, 180, 160, 12, 6, UI_BORDER);
@@ -323,7 +323,7 @@ void drawMenuScrollbar(uint8_t top) {
   if (MENU_COUNT <= MENU_WIN_ROWS) return;
   int16_t listH = MENU_WIN_ROWS * MENU_ROWH + (MENU_WIN_ROWS - 1) * MENU_ROWGAP;  // 220
   tft.fillRect(232, MENU_Y0, 4, listH, UI_CARD);  // 轨道
-  uint8_t thumbH = listH * MENU_WIN_ROWS / MENU_COUNT;  // 220*7/11=140
+  uint8_t thumbH = listH * MENU_WIN_ROWS / MENU_COUNT;  // 220*7/12=128
   uint8_t thumbY = MENU_Y0 + top * (listH - thumbH) / (MENU_COUNT - MENU_WIN_ROWS);
   tft.fillRect(232, thumbY, 4, thumbH, UI_ACCENT);  // 滑块
 }
@@ -610,7 +610,7 @@ void drawAboutScreen(const String &build) {
   uiTitle("关于");
   tft.fillRoundRect(8, 32, 224, 152, 6, UI_CARD);
   tft.drawRoundRect(8, 32, 224, 152, 6, UI_BORDER);
-  printCN(16, 40, "ESP32-S2 硬件测试 r55", ST77XX_WHITE, UI_CARD, 1);
+  printCN(16, 40, "ESP32-S2 硬件测试 r59", ST77XX_WHITE, UI_CARD, 1);
   printCN(16, 68, "红外接收 IO16 发送 IO17", ST77XX_WHITE, UI_CARD, 1);
   printCN(16, 96, ("编译" + build).c_str(), ST77XX_WHITE, UI_CARD, 1);  // "编译26/10/29:E" 152px，卡内 208px 放得下
   printCN(16, 124, "KEY4 菜单 KEY1 确认", ST77XX_WHITE, UI_CARD, 1);

@@ -1,6 +1,6 @@
 //================================================================
-// ESP32S2_HWTest_r55.ino
-// CoreBoard ESP32-S2 mini 硬件测试（r55：一级菜单加芯片详情页）
+// ESP32S2_HWTest_r59.ino
+// CoreBoard ESP32-S2 mini 硬件测试（r59：修 r56 编译错：菜单切换日志挪进分支内，if-else 链恢复）
 //
 // 相对 r42 的改动：
 //   1. 温度推送取消 0.5°C 阈值，改每 1 秒推一次当前值（BMP 温度与芯片温度都是）。
@@ -170,6 +170,7 @@
 #include <time.h>
 #include <Wire.h>
 #include "driver/temperature_sensor.h"  // 芯片内核温度（S2 内置 TSENS，新版 IDF 驱动）
+#include "esp_task_wdt.h"  // 任务看门狗（r56：loop 卡死自动重启）
 #include "HomeSpan.h"
 #include "cn6.h"
 
@@ -219,8 +220,15 @@ const char *keyNames[4]  = {"KEY1", "KEY2", "KEY3", "KEY4"};
 // ---------------- 菜单状态 ----------------
 enum MenuState { ST_HOME, ST_MENU, ST_LAMP, ST_AC, ST_DECODE, ST_IRTEST, ST_WIFI, ST_ABOUT, ST_I2C, ST_COPY, ST_HS, ST_DISP, ST_CHIP };
 MenuState state = ST_HOME;
-uint8_t menuSel = 0;   // 一级菜单选择（0~9）
+uint8_t menuSel = 0;   // 一级菜单选择（0~11，12 项）
 uint8_t menuTop = 0;   // 一级菜单窗口顶行（可见 7 行，上限随 MENU_COUNT 动态算，空调页同款）
+
+// 一级菜单状态钳制（r56 防御）：menuSel/menuTop 若被异常改写越界，行绘制会算出屏外坐标；
+//   正常流程下两者恒在合法范围，本函数是 no-op，只防状态损坏后菜单假死。
+static void fixMenuState() {
+  if (menuSel >= MENU_COUNT) menuSel = 0;
+  if (menuTop > MENU_COUNT - MENU_WIN_ROWS) menuTop = MENU_COUNT - MENU_WIN_ROWS;
+}
 // r45 注：r44 的一级菜单滑动动画已拿掉——每帧重画 3 张卡片 + 中文点阵字，
 // S2 单核 + SPI 跟不上，跳帧还留残影（照片里行间拖影即此）；改回瞬时切换。
 uint8_t lampSel = 0;   // 灯键码选择（0~8）
@@ -308,9 +316,9 @@ void sendR05D(uint8_t a, uint8_t b, uint8_t c) {
 
 // 发送灯码（NEC 32 位）：Raw 版只发红外 + 串口，不碰屏幕，供 act* 共用
 void sendLampRaw(uint8_t idx) {
-  irrecv.disableIRIn();  // 发送时关接收：免自激回波、免跟发送抢 RMT/中断
+  // r58：发送时不再关接收头，让发送回波被接收头解码、显示在接收行（发送确认）；
+  //   NEC/COOLIX 回波能干净解码，不会像 Raw 回波那样出 UNKNOWN
   irsend.sendNEC(LAMP_CODES[idx].nec, 32);
-  irrecv.enableIRIn();
   Serial.print("发送灯码: ");
   Serial.print(LAMP_CODES[idx].name);
   Serial.print(" NEC ");
@@ -326,9 +334,8 @@ void sendLamp(uint8_t idx) {
 
 // 发送空调码（R05D 构造发送）：Raw 版只发红外 + 串口，不碰屏幕
 void sendAcRaw(uint8_t idx) {
-  irrecv.disableIRIn();  // 发送时关接收（同 sendLampRaw）
+  // r58：发送时不关接收头（同 sendLampRaw），回波显示在接收行
   sendR05D(AC_CODES[idx].a, AC_CODES[idx].b, AC_CODES[idx].c);
-  irrecv.enableIRIn();
   Serial.print("发送空调码: ");
   Serial.println(AC_CODES[idx].name);
 }
@@ -342,6 +349,7 @@ void sendAc(uint8_t idx) {
 
 // 发送空调功能码（固定码，R05D 构造发送）
 void sendAcFunc(uint8_t idx) {
+  // r58：撤销 r57 加的开关接收，发送时不关接收头，回波显示在接收行（与灯/空调其它发送一致）
   sendR05D(ACFUNC_CODES[idx].a, ACFUNC_CODES[idx].b, ACFUNC_CODES[idx].c);
   lastSent = ACFUNC_CODES[idx].name;
   updateAcSendLine(lastSent);  // 只刷底部卡片内“发送:”行，不全屏
@@ -367,9 +375,8 @@ void sendAcStateRaw() {
   uint8_t modeBits = AC_MODES[acMode].bits;
   uint8_t b = (fanBits << 5) | 0x1F;
   uint8_t c = (tempBits << 4) | (modeBits << 2);
-  irrecv.disableIRIn();  // 发送时关接收（同 sendLampRaw）
+  // r58：发送时不关接收头（同 sendLampRaw），回波显示在接收行
   sendR05D(0xB2, b, c);
-  irrecv.enableIRIn();
   Serial.print("发送空调状态: ");
   Serial.print(buildAcStatus());
   Serial.print(" -> B2");
@@ -797,7 +804,7 @@ void wifiHandleSave() {
   // 保持热点开着（以便回传结果），尝试连接，最多等 10 秒
   WiFi.begin(ssid, pass);
   unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(500);
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(500); }  // r56：等连接时喂狗，防看门狗误触发
   if (WiFi.status() == WL_CONNECTED) {
     String body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head><body>"
@@ -1403,7 +1410,7 @@ void refreshChipCard() {  // 芯片页 1 秒刷新：只刷卡片（值是实时
 void drawScreen() {
   switch (state) {
     case ST_HOME: refreshHomeData(); drawHomeScreen(homeMode, homeClock, homeYday, homeBmpTemp, homeBmpPress, homeCalMonth, homeCalDates, homeCalTodayIdx, homeLunar, dispMask); syncHomeLines(); break;
-    case ST_MENU: drawMenuScreen(menuSel, menuTop); break;
+    case ST_MENU: fixMenuState(); drawMenuScreen(menuSel, menuTop); break;
     case ST_LAMP: drawLampScreen(lampSel, lastSent, lastRecv); break;
     case ST_AC: drawAcScreen(acSel, acTop, lastSent, lastRecv, buildAcStatus()); break;
     case ST_DECODE: drawDecodeScreen(irRxProto, irRxHex, recvBits, recvLen); break;
@@ -1443,6 +1450,7 @@ void onKeyPressed(uint8_t i) {
       if (i == 3) { state = ST_MENU; screenDirty = true; }  // KEY4 -> 一级菜单（其他键只更新指示灯，不刷屏）
       break;
     case ST_MENU:
+      fixMenuState();  // r56 防御：先钳制状态再切换，防越界行绘制
       if (i == 1) {  // KEY2 加 -> 下一项（到窗口边缘时滚动，空调页同款）
         uint8_t old = menuSel;
         menuSel = (menuSel + 1) % MENU_COUNT;
@@ -1453,6 +1461,7 @@ void onKeyPressed(uint8_t i) {
           updateMenuRow(old, menuTop, false);
           updateMenuRow(menuSel, menuTop, true);
         }
+        Serial.print("菜单 -> "); Serial.print(menuSel); Serial.print("/"); Serial.print(MENU_COUNT); Serial.print(" top="); Serial.println(menuTop);
       }
       else if (i == 2) {  // KEY3 减 -> 上一项（到窗口边缘时滚动，空调页同款）
         uint8_t old = menuSel;
@@ -1464,16 +1473,18 @@ void onKeyPressed(uint8_t i) {
           updateMenuRow(old, menuTop, false);
           updateMenuRow(menuSel, menuTop, true);
         }
+        Serial.print("菜单 -> "); Serial.print(menuSel); Serial.print("/"); Serial.print(MENU_COUNT); Serial.print(" top="); Serial.println(menuTop);
       }
       else if (i == 0) {  // KEY1 确认 -> 进入子菜单
+        // r57：进灯/空调/解码/复制页时强制重开接收头，防接收头被某条发送路径关掉后没开回来
         switch (menuSel) {
-          case 0: state = ST_LAMP; break;
-          case 1: state = ST_AC; break;
-          case 2: state = ST_DECODE; break;
+          case 0: state = ST_LAMP; irrecv.enableIRIn(); break;
+          case 1: state = ST_AC; irrecv.enableIRIn(); break;
+          case 2: state = ST_DECODE; irrecv.enableIRIn(); break;
           case 3: state = ST_IRTEST; break;
           case 4: state = ST_WIFI; break;
           case 5: state = ST_I2C; break;
-          case 6: state = ST_COPY; refreshCopyLines(); break;
+          case 6: state = ST_COPY; irrecv.enableIRIn(); refreshCopyLines(); break;
           case 7: state = ST_HS; break;
           case 8: state = ST_DISP; break;
           case 9: state = ST_ABOUT; break;
@@ -1758,10 +1769,23 @@ void setup() {
   gBuildTime = fmtBuildTime();  // 关于页显示用（开机时算一次，不用每次进关于页重算）
 
   lastKeyMs = millis();  // 熄屏计时从开机完成起算
+
+  // 任务看门狗（r56）：loop 卡死超 10 秒自动重启，不再永久死机；开机初始化慢，
+  //   故在 setup 末尾才启用（WiFi 等待循环里另有喂狗，见 wifiHandleSave）。
+  {
+    esp_task_wdt_config_t wdtCfg = {
+      .timeout_ms = 10000,
+      .idle_core_mask = 0,
+      .trigger_panic = true,
+    };
+    esp_task_wdt_init(&wdtCfg);  // 若核心已启用则返回失败，可忽略（已有看门狗在跑）
+    esp_task_wdt_add(NULL);      // 当前任务即 loop 任务；若已加入则返回失败，可忽略
+  }
 }
 
 void loop() {
   unsigned long now = millis();
+  esp_task_wdt_reset();  // r56：每轮喂狗，loop 卡死超 10 秒由看门狗重启
 
   // 1. 首页：联网/断网切换、模式变化时全屏重画；同模式下每秒只刷变化的
   //    行/卡（不全屏）：时钟模式走 updateHomeClockLines，同步中只刷温压卡；
