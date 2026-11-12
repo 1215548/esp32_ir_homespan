@@ -1,6 +1,6 @@
 //================================================================
-// ESP32S2_HWTest_r59.ino
-// CoreBoard ESP32-S2 mini 硬件测试（r59：修 r56 编译错：菜单切换日志挪进分支内，if-else 链恢复）
+// ESP32S2_HWTest_r60.ino
+// CoreBoard ESP32-S2 mini 硬件测试（r60：Deepseek 修改有时重启的问题：看门狗 reconfigure 到 10 秒、农历 HTTPS 改独立 12KB 任务、loop 栈提到 16KB）
 //
 // 相对 r42 的改动：
 //   1. 温度推送取消 0.5°C 阈值，改每 1 秒推一次当前值（BMP 温度与芯片温度都是）。
@@ -171,8 +171,15 @@
 #include <Wire.h>
 #include "driver/temperature_sensor.h"  // 芯片内核温度（S2 内置 TSENS，新版 IDF 驱动）
 #include "esp_task_wdt.h"  // 任务看门狗（r56：loop 卡死自动重启）
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "HomeSpan.h"
 #include "cn6.h"
+
+// loop 任务栈从 Arduino 默认 8KB 提到 16KB（上电随机重启的兜底：HomeSpan/网页/字符串
+//   深调用偶发栈溢出；HTTPS 已挪到独立任务，这里再留足余量）
+SET_LOOP_TASK_STACK_SIZE(16384);
 
 // ---------------- 引脚 ----------------
 #define TFT_CS    5
@@ -1241,6 +1248,61 @@ bool fetchLunar(String &monthName, String &dayName) {
   return true;
 }
 
+// 农历异步拉取（修复上电后无操作随机重启）：
+//   TLS 握手要吃掉数 KB 栈，在 loop 任务（Arduino 默认栈仅 8KB）里直接跑
+//   WiFiClientSecure 容易栈溢出重启；同时 DNS/TLS 阻塞时主循环停摆，
+//   Arduino 默认任务看门狗是 5 秒且 panic=true，会被直接复位。
+//   这里改到独立任务（12KB 栈）里取，loop 只发通知、取结果，不再被网络阻塞。
+#define LUNAR_TASK_STACK 12288
+static TaskHandle_t     lunarTaskHandle  = NULL;
+static SemaphoreHandle_t lunarMutex      = NULL;
+static volatile bool    lunarFetching    = false;  // 任务正在取（loop 不重复下发）
+static volatile bool    lunarResultReady = false;
+static char lunarResMonth[32] = "";
+static char lunarResDay[32]   = "";
+static char lunarResDate[16]  = "";  // 取到结果时的公历日期 "YYYY-M-D"
+
+static void lunarFetchTask(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // 等 loop 通知
+    String mName, dName;
+    if (fetchLunar(mName, dName)) {
+      time_t nowSec = time(nullptr);
+      struct tm tmNow;
+      localtime_r(&nowSec, &tmNow);
+      if (xSemaphoreTake(lunarMutex, portMAX_DELAY) == pdTRUE) {
+        snprintf(lunarResMonth, sizeof(lunarResMonth), "%s", mName.c_str());
+        snprintf(lunarResDay, sizeof(lunarResDay), "%s", dName.c_str());
+        snprintf(lunarResDate, sizeof(lunarResDate), "%d-%d-%d",
+                 tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday);
+        lunarResultReady = true;
+        xSemaphoreGive(lunarMutex);
+      }
+    }
+    lunarFetching = false;
+  }
+}
+
+// loop 调用：先并入任务取回的结果，再按需下发新的拉取请求（60 秒节流沿用原逻辑；
+//   任务没建起来时农历不显示，不影响其它功能）。
+static void pollLunarAsync(const String &todayStr) {
+  if (lunarMutex && xSemaphoreTake(lunarMutex, 0) == pdTRUE) {
+    if (lunarResultReady) {
+      homeLunar = String(lunarResMonth) + lunarResDay;
+      lastLunarDate = lunarResDate;
+      lunarResultReady = false;
+    }
+    xSemaphoreGive(lunarMutex);
+  }
+  if (!lunarTaskHandle || lunarFetching) return;
+  if (homeLunar.length() != 0 && todayStr == lastLunarDate) return;
+  unsigned long nowMs = millis();
+  if (lastLunarTryMs != 0 && nowMs - lastLunarTryMs < 60000) return;
+  lastLunarTryMs = nowMs;
+  lunarFetching = true;
+  xTaskNotifyGive(lunarTaskHandle);
+}
+
 void refreshHomeData() {
   refreshBmpStrings();  // BMP 与 WiFi/NTP 无关，三种模式都要刷
   if (WiFi.status() != WL_CONNECTED) { homeMode = 0; return; }
@@ -1267,19 +1329,11 @@ void refreshHomeData() {
   int year = tm.tm_year + 1900;
   bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
   homeYday = String(tm.tm_yday + 1) + "/" + String(leap ? 366 : 365);
-  // 当天农历（API，date=today）：首次、隔日、或上次失败 60s 后重试；失败保留旧值
-  //   （refreshHomeData 每秒跑一次，60s 节流 + 未联网时 fetchLunar 直接返回，不刷屏不阻塞久）
+  // 当天农历（API，date=today）：首次、隔日、或上次失败 60s 后重试；失败保留旧值。
+  //   拉取走独立任务（见 pollLunarAsync），loop 不再直接跑 HTTPS，
+  //   避免 TLS 栈溢出 / 网络阻塞触发看门狗复位。
   String todayStr = String(tm.tm_year + 1900) + "-" + String(tm.tm_mon + 1) + "-" + String(tm.tm_mday);
-  unsigned long nowMs = millis();
-  if ((homeLunar.length() == 0 || todayStr != lastLunarDate) &&
-      (lastLunarTryMs == 0 || nowMs - lastLunarTryMs >= 60000)) {
-    lastLunarTryMs = nowMs;
-    String mName, dName;
-    if (fetchLunar(mName, dName)) {
-      homeLunar = mName + dName;
-      lastLunarDate = todayStr;
-    }
-  }
+  pollLunarAsync(todayStr);
   homeMode = 1;
 }
 
@@ -1758,6 +1812,17 @@ void setup() {
   // NTP：北京时间（UTC+8，无夏令时），联网后后台自动同步，首页时钟用
   configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org", "time.google.com");
 
+  // 农历拉取任务：HTTPS 放独立栈里跑（见 pollLunarAsync 上方注释）
+  lunarMutex = xSemaphoreCreateMutex();
+  if (lunarMutex) {
+    if (xTaskCreate(lunarFetchTask, "lunarFetch", LUNAR_TASK_STACK, NULL, 1, &lunarTaskHandle) != pdPASS) {
+      lunarTaskHandle = NULL;
+      Serial.println("农历拉取任务创建失败（首页农历将不显示）");
+    }
+  } else {
+    Serial.println("农历互斥锁创建失败（首页农历将不显示）");
+  }
+
   // 红外复制：开机从 NVS 读入 10 个编号的键码与名称
   copyLoadAll();
 
@@ -1772,13 +1837,17 @@ void setup() {
 
   // 任务看门狗（r56）：loop 卡死超 10 秒自动重启，不再永久死机；开机初始化慢，
   //   故在 setup 末尾才启用（WiFi 等待循环里另有喂狗，见 wifiHandleSave）。
+  // 注意：Arduino 核心在启动时已按 IDF 默认（5 秒、panic）初始化过看门狗，
+  //   esp_task_wdt_init 此时返回 ESP_ERR_INVALID_STATE 且不会改超时；必须 reconfigure，
+  //   否则 loop 任务会被挂到 5 秒看门狗上，网络稍有阻塞就复位（上电随机重启的原因之一）。
   {
     esp_task_wdt_config_t wdtCfg = {
       .timeout_ms = 10000,
       .idle_core_mask = 0,
       .trigger_panic = true,
     };
-    esp_task_wdt_init(&wdtCfg);  // 若核心已启用则返回失败，可忽略（已有看门狗在跑）
+    esp_err_t wdtErr = esp_task_wdt_init(&wdtCfg);
+    if (wdtErr == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdtCfg);
     esp_task_wdt_add(NULL);      // 当前任务即 loop 任务；若已加入则返回失败，可忽略
   }
 }
