@@ -1,5 +1,5 @@
 //================================================================
-// ui.h - 屏幕绘制（r60 菜单版，深色卡片风）
+// ui.h - 屏幕绘制（r61 菜单版，深色卡片风）
 // 只负责把给定内容画到屏幕上，不含业务逻辑。
 //
 // 依赖（主文件须按此顺序准备好再 include 本文件）：
@@ -160,15 +160,18 @@ void uiTitle(const char *title) {
 // 单行绘制（全屏列表与局部刷新共用）：圆角卡片 + 右侧 chevron。
 // 选中：深青底 + 青色边框；未选中：卡片底 + 深灰边框；文字均为白字
 // （16 点阵无粗体，选中靠卡片区分）。文字背景须与卡片底一致，否则字块发黑。
+// r61：拼接行文字改用栈缓冲，菜单反复滚动不再每次 malloc/free String
+//   （内部堆只有十几 KB，长期反复刷菜单的碎片是偶发重启的隐患）。
 void uiListRow(const char *name, const char *hex, int16_t y, int16_t rowH, bool isSel) {
   uint16_t fill = isSel ? UI_SEL : UI_CARD;
   uint16_t border = isSel ? UI_ACCENT : UI_BORDER;
   tft.fillRoundRect(8, y, 224, rowH, 6, fill);
   tft.drawRoundRect(8, y, 224, rowH, 6, border);
-  String line = name;
-  if (hex && hex[0]) { line += " "; line += hex; }
+  char line[48];
+  if (hex && hex[0]) snprintf(line, sizeof(line), "%s %s", name, hex);
+  else snprintf(line, sizeof(line), "%s", name);
   int16_t ty = y + (rowH - 16) / 2;
-  printCN(16, ty, line.c_str(), ST77XX_WHITE, fill, 1);
+  printCN(16, ty, line, ST77XX_WHITE, fill, 1);
   uint16_t cc = isSel ? UI_ACCENT : UI_MUTED;
   tft.drawLine(216, ty + 2, 226, ty + 8, cc);
   tft.drawLine(226, ty + 8, 216, ty + 14, cc);
@@ -266,7 +269,7 @@ void bootAnimation() {
   const char *title = "ESP32-S2-IR";
   int16_t tw = cnTextWidth(title, 2);
   printCN((TFT_W - tw) / 2, 100, title, ST77XX_WHITE, UI_BG, 2);
-  const char *sub = "硬件测试 r60";
+  const char *sub = "硬件测试 r61";
   int16_t sw = cnTextWidth(sub, 1);
   printCN((TFT_W - sw) / 2, 150, sub, UI_MUTED, UI_BG, 1);
   tft.drawRoundRect(40, 180, 160, 12, 6, UI_BORDER);
@@ -279,10 +282,12 @@ void bootAnimation() {
 
 void drawHomeScreen(uint8_t mode, const String &clock, const String &yday,
                     const String &bmpTemp, const String &bmpPress,
-                    const String &calMonth, const int *calDates, int calTodayIdx, const String &lunarStr, uint8_t mask) {
+                    const String &calMonth, const int *calDates, int calTodayIdx, const String &lunarStr, uint8_t mask,
+                    const String &devName, const String &radioLine) {
   tft.fillScreen(UI_BG);
-  // 状态栏：左设备名，右连接状态（绿点 + WiFi / 未连接；只显示状态，不显示 SSID）
-  printCN(8, 8, "ESP32-S2-IR", UI_MUTED, UI_BG, 1);
+  // 状态栏：左设备名（网页可改，NVS 掉电保存），右连接状态（绿点 + WiFi / 未连接）
+  String nm = truncToW(devName, 148);  // 给右侧“未连接/WiFi”留位置，超长截断
+  printCN(8, 8, nm.c_str(), UI_MUTED, UI_BG, 1);
   bool conn = (mode == 1 || mode == 2);
   String rs = conn ? "WiFi" : "未连接";
   int16_t rw = cnTextWidth(rs.c_str(), 1);
@@ -311,11 +316,21 @@ void drawHomeScreen(uint8_t mode, const String &clock, const String &yday,
     printCN((TFT_W - sw) / 2, 124, s.c_str(), UI_MUTED, UI_BG, 1);
   }
   drawHomeBmpCards(bmpTemp, bmpPress);
+  // 收音机后台播放提示（r61）：只在后台播放时有值；KEY2/KEY3 在首屏切换频道
+  if (radioLine.length()) {
+    printCN(8, 280, truncToW(radioLine, TFT_W - 16).c_str(), UI_ACCENT, UI_BG, 1);
+  }
   printCN(8, 303, "KEY4 进入菜单", UI_MUTED, UI_BG, 1);
 }
 
+// 首屏收音机提示行的局部刷新（切频道用，不整屏重画）
+void updateHomeRadioLine(const String &line) {
+  tft.fillRect(0, 278, TFT_W, 20, UI_BG);
+  if (line.length()) printCN(8, 280, truncToW(line, TFT_W - 16).c_str(), UI_ACCENT, UI_BG, 1);
+}
+
 // ---------------- 一级菜单 ----------------
-const char *MENU_ITEMS[] = {"灯", "空调", "红外解码", "红外测试", "WiFi设置", "I2C寻址", "红外复制", "HomeSpan", "显示设置", "关于", "芯片详情", "返回"};
+const char *MENU_ITEMS[] = {"灯", "空调", "红外解码", "红外测试", "WiFi设置", "I2C寻址", "红外复制", "HomeSpan", "显示设置", "任务详情", "关于", "芯片详情", "收音机", "返回"};
 const uint8_t MENU_COUNT = sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0]);
 
 // 一级菜单滚动条（x=232..235；项数不多于可见行时不画，免除零分母）
@@ -610,7 +625,7 @@ void drawAboutScreen(const String &build) {
   uiTitle("关于");
   tft.fillRoundRect(8, 32, 224, 152, 6, UI_CARD);
   tft.drawRoundRect(8, 32, 224, 152, 6, UI_BORDER);
-  printCN(16, 40, "ESP32-S2 硬件测试 r60", ST77XX_WHITE, UI_CARD, 1);
+  printCN(16, 40, "ESP32-S2 硬件测试 r61", ST77XX_WHITE, UI_CARD, 1);
   printCN(16, 68, "红外接收 IO16 发送 IO17", ST77XX_WHITE, UI_CARD, 1);
   printCN(16, 96, ("编译" + build).c_str(), ST77XX_WHITE, UI_CARD, 1);  // "编译26/10/29:E" 152px，卡内 208px 放得下
   printCN(16, 124, "KEY4 菜单 KEY1 确认", ST77XX_WHITE, UI_CARD, 1);
@@ -622,22 +637,24 @@ void drawAboutScreen(const String &build) {
   printCN(8, 288, "KEY4 返回", UI_MUTED, UI_BG, 1);
 }
 
-// 芯片详情页（r55）：卡片 6 行（芯片型号 / RAM 已用总量 / RAM 占用率 / ROM 已用总量 / ROM 占用率 / 芯片温度）；
+// 芯片详情页（r55/r61）：卡片 7 行（芯片型号 / RAM 已用 / RAM 占用率 /
+//   ROM 已用 / ROM 占用率 / 芯片温度 / 上次复位原因）；
 //   drawChipCard 只刷卡片（1 秒刷新用，不清屏不重画标题，免闪），drawChipScreen 整页（进页时用）
-void drawChipCard(const String &chip, const String &ram, const String &ramPct, const String &rom, const String &romPct, const String &temp) {
-  tft.fillRoundRect(8, 32, 224, 176, 6, UI_CARD);
-  tft.drawRoundRect(8, 32, 224, 176, 6, UI_BORDER);
+void drawChipCard(const String &chip, const String &ram, const String &ramPct, const String &rom, const String &romPct, const String &temp, const String &reset) {
+  tft.fillRoundRect(8, 32, 224, 204, 6, UI_CARD);
+  tft.drawRoundRect(8, 32, 224, 204, 6, UI_BORDER);
   printCN(16, 40, chip.c_str(), ST77XX_WHITE, UI_CARD, 1);
   printCN(16, 68, ram.c_str(), ST77XX_WHITE, UI_CARD, 1);
   printCN(16, 96, ramPct.c_str(), ST77XX_WHITE, UI_CARD, 1);
   printCN(16, 124, rom.c_str(), ST77XX_WHITE, UI_CARD, 1);
   printCN(16, 152, romPct.c_str(), ST77XX_WHITE, UI_CARD, 1);
   printCN(16, 180, temp.c_str(), ST77XX_WHITE, UI_CARD, 1);
+  printCN(16, 208, reset.c_str(), ST77XX_WHITE, UI_CARD, 1);
 }
-void drawChipScreen(const String &chip, const String &ram, const String &ramPct, const String &rom, const String &romPct, const String &temp) {
+void drawChipScreen(const String &chip, const String &ram, const String &ramPct, const String &rom, const String &romPct, const String &temp, const String &reset) {
   tft.fillScreen(UI_BG);
   uiTitle("芯片详情");
-  drawChipCard(chip, ram, ramPct, rom, romPct, temp);
+  drawChipCard(chip, ram, ramPct, rom, romPct, temp, reset);
   printCN(8, 288, "KEY4 返回", UI_MUTED, UI_BG, 1);
 }
 
@@ -710,4 +727,307 @@ void drawCopyScreen(const String &slot, const String &mode, const String &status
   printCN(8, 250, "KEY1 学习/存储", UI_MUTED, UI_BG, 1);
   printCN(8, 274, "KEY2 发射 KEY3 选编号", UI_MUTED, UI_BG, 1);
   printCN(8, 298, "KEY4 返回", UI_MUTED, UI_BG, 1);
+}
+
+// ---------------- 任务详情（r61）----------------
+// 实时显示 FreeRTOS 任务：名称 / 状态 / 优先级 / 栈余（KB）；
+// 顶部汇总任务数 + 总 CPU 占用；底部显示内部堆余量。
+// 每 1 秒由 appTask 调 drawTasksCard 局部刷新（不动标题/卡片边框/表头），
+// KEY2/KEY3 滚动列表。
+#define TASK_ROW_Y0   76
+#define TASK_ROWH     24
+#define TASK_WIN_ROWS 7
+
+struct TaskViewRow {
+  char name[12];       // 任务名（最多 10 个 ASCII 字符 + 结束符）
+  const char *state;   // UTF-8 单字状态：运/就/阻/挂/删
+  uint16_t stateColor; // 状态颜色
+  uint8_t prio;        // 当前优先级
+  uint16_t stackK;     // 栈余（KB）
+};
+
+void drawTaskRow(const TaskViewRow &r, int16_t y) {
+  char b[12];
+  printCN(16, y + 3, r.name, ST77XX_WHITE, UI_CARD, 1);
+  printCN(136, y + 3, r.state, r.stateColor, UI_CARD, 1);
+  snprintf(b, sizeof(b), "P%u", r.prio);
+  printCN(156, y + 3, b, UI_MUTED, UI_CARD, 1);
+  snprintf(b, sizeof(b), "%uK", r.stackK);
+  printCN(184, y + 3, b, UI_ACCENT, UI_CARD, 1);
+}
+
+// 局部刷新：汇总行 + 可见任务行（不清屏、不重画标题/边框/表头）
+void drawTasksCard(const TaskViewRow *rows, uint8_t count, uint8_t top, uint8_t cpuPct) {
+  char b[40];
+  tft.fillRect(16, 36, 208, 18, UI_CARD);
+  snprintf(b, sizeof(b), "任务 %u   CPU %u%%", count, cpuPct);
+  printCN(16, 38, b, UI_MUTED, UI_CARD, 1);
+  for (uint8_t r = 0; r < TASK_WIN_ROWS; r++) {
+    int16_t y = TASK_ROW_Y0 + r * TASK_ROWH;
+    tft.fillRect(16, y, 208, 20, UI_CARD);
+    uint8_t idx = top + r;
+    if (idx < count) drawTaskRow(rows[idx], y);
+  }
+}
+
+void drawTasksScreen(const TaskViewRow *rows, uint8_t count, uint8_t top, uint8_t cpuPct, uint32_t heapK) {
+  tft.fillScreen(UI_BG);
+  uiTitle("任务详情");
+  tft.fillRoundRect(8, 32, 224, 220, 6, UI_CARD);
+  tft.drawRoundRect(8, 32, 224, 220, 6, UI_BORDER);
+  printCN(16, 56, "名称", UI_MUTED, UI_CARD, 1);
+  printCN(136, 56, "状态", UI_MUTED, UI_CARD, 1);
+  printCN(156, 56, "P", UI_MUTED, UI_CARD, 1);
+  printCN(184, 56, "栈K", UI_MUTED, UI_CARD, 1);
+  drawTasksCard(rows, count, top, cpuPct);
+  char b[40];
+  snprintf(b, sizeof(b), "KEY2下 KEY3上 堆%uK", (unsigned)heapK);
+  printCN(8, 264, b, UI_MUTED, UI_BG, 1);
+  printCN(8, 288, "KEY4 返回", UI_MUTED, UI_BG, 1);
+}
+
+// ---------------- 收音机（TEA5767）----------------
+// 布局：顶部频率大字 + 频道序号/静音徽章 + 信号竖条；下方 5 行功能列表
+// （8 项滚动）。底部竖条表示信号强度（TEA5767 无音量寄存器，音量调节已取消）。
+#define RADIO_WIN_ROWS 5
+#define RADIO_ITEM_COUNT 8
+
+void printBigAscii(int16_t x, int16_t y, const char *s, uint16_t color, uint16_t bg, uint8_t size) {
+  tft.setTextSize(size);
+  tft.setTextColor(color, bg);
+  tft.setCursor(x, y);
+  tft.print(s);
+}
+
+// r62：状态卡局部刷新缓存。整卡只在进页/换页全屏绘制时重画一次；
+//   之后每秒的信号更新只刷新变化的小区域，避免上半部分整卡闪烁。
+static uint32_t rsLastShownFreq = 0xFFFFFFFF;
+static int16_t  rsLastIdx = -999;
+static uint8_t  rsLastCount = 255, rsLastFound = 255;
+static bool     rsLastMuted = false, rsLastPresent = false, rsLastStereo = false, rsLastScanning = false;
+static uint8_t  rsLastSignal = 255;
+static uint32_t rsLastScanFreq = 0xFFFFFFFF;
+static int16_t  radioBarH[16];
+static bool     radioBarCacheOk = false;
+static bool     radioBarMuted = false;
+
+static void radioDrawFreqArea(uint32_t f, bool muted, bool present) {
+  tft.fillRect(16, 34, 150, 30, UI_CARD);  // 到 x=166，避开右侧 x=168 的徽章
+  char b[40];
+  snprintf(b, sizeof(b), "%u.%02u", f / 1000, (f % 1000) / 10);
+  printBigAscii(16, 36, b, (muted || !present) ? UI_MUTED : ST77XX_WHITE, UI_CARD, 3);
+  int16_t fw = (int16_t)strlen(b) * 18;
+  printCN(16 + fw + 6, 44, "MHz", UI_MUTED, UI_CARD, 1);
+}
+
+static void radioDrawBadge(bool muted, bool present) {
+  const int16_t bx = 168, bw = 56;  // 56 宽，“无模块”48px 也放得下
+  tft.fillRect(bx, 38, bw, 20, UI_CARD);
+  const char *badge = present ? (muted ? "静音" : "播放") : "无模块";
+  uint16_t pill = !present ? ST77XX_RED : (muted ? UI_AMBER : UI_GREEN);
+  tft.fillRoundRect(bx, 38, bw, 20, 10, pill);
+  int16_t tw = cnTextWidth(badge, 1);
+  printCN(bx + (bw - tw) / 2, 40, badge, UI_DARKTXT, pill, 1);
+}
+
+static void radioDrawStationLine(int16_t idx, uint8_t count, bool present) {
+  tft.fillRect(16, 60, 208, 18, UI_CARD);
+  char b[40];
+  if (!present) {
+    printCN(16, 62, "未检测到 TEA5767", ST77XX_RED, UI_CARD, 1);
+  } else if (count == 0) {
+    printCN(16, 62, "请先自动搜台", UI_AMBER, UI_CARD, 1);
+  } else if (idx >= 0) {
+    snprintf(b, sizeof(b), "频道 %d/%u", (int)idx + 1, count);
+    printCN(16, 62, b, ST77XX_WHITE, UI_CARD, 1);
+  } else {
+    snprintf(b, sizeof(b), "频道 --/%u", count);
+    printCN(16, 62, b, UI_MUTED, UI_CARD, 1);
+  }
+}
+
+static void radioDrawInfoLine(bool scanning, uint8_t found, uint8_t signal,
+                              bool stereo, bool present) {
+  tft.fillRect(16, 80, 208, 18, UI_CARD);
+  char b[40];
+  if (scanning) {
+    snprintf(b, sizeof(b), "搜台中 已存%u", found);
+    printCN(16, 82, b, UI_ACCENT, UI_CARD, 1);
+  } else if (!present) {
+    printCN(16, 82, "检查 I2C 0x60 接线", UI_MUTED, UI_CARD, 1);
+  } else {
+    snprintf(b, sizeof(b), "信号 %u/15", signal);
+    printCN(16, 82, b, UI_MUTED, UI_CARD, 1);
+    // “立体声/单声道”右对齐到卡片右侧，避开左侧信号数字（多频道两位数时也不重叠）
+    const char *st = stereo ? "立体声" : "单声道";
+    int16_t sw = cnTextWidth(st, 1);
+    printCN(224 - sw, 82, st, UI_MUTED, UI_CARD, 1);
+  }
+}
+
+static void radioDrawBars(uint8_t signal, bool muted, bool scanning, uint32_t scanFreq, bool present) {
+  const int16_t barN = 16, barW = 8, gap = 5;
+  int16_t total = barN * barW + (barN - 1) * gap;
+  int16_t x0 = 16 + (208 - total) / 2;
+  if (!present) {
+    if (radioBarCacheOk) tft.fillRect(16, 100, 208, 32, UI_CARD);
+    radioBarCacheOk = false;
+    return;
+  }
+  if (!radioBarCacheOk || radioBarMuted != muted) {
+    tft.fillRect(16, 100, 208, 32, UI_CARD);
+    for (int16_t i = 0; i < barN; i++) radioBarH[i] = -1;
+    radioBarCacheOk = true;
+    radioBarMuted = muted;
+  }
+  uint16_t col = muted ? UI_MUTED : UI_ACCENT;
+  uint32_t tick = millis() / 120;  // 模拟律动节拍（约 8 帧/秒）
+  for (int16_t i = 0; i < barN; i++) {
+    uint8_t s = scanning ? (uint8_t)((scanFreq / 50 + i * 7) % 16) : signal;
+    int16_t h = 3 + (int16_t)(s * (5 + (i * 5 + 2) % 12)) / 8;
+    if (h > 26) h = 26;
+    if (s == 0) {
+      h = -3;  // 空信号用负值，和正常 3px 低柱区分
+    } else if (!scanning && !muted) {
+      // 真实音频未进 ADC，这里做轻微起伏的模拟律动；幅度不超过信号基准
+      int16_t wave = (int16_t)((i * 37 + tick * 53) % 7) - 3;
+      h += wave;
+      if (h < 3) h = 3;
+      if (h > 26) h = 26;
+    }
+    int16_t x = x0 + i * (barW + gap);
+    if (radioBarH[i] == h) continue;  // 这一根没变，不重画
+    int16_t oldAbs = radioBarH[i] < 0 ? -radioBarH[i] : radioBarH[i];
+    int16_t newAbs = h < 0 ? -h : h;
+    int16_t clearH = oldAbs > newAbs ? oldAbs : newAbs;
+    if (clearH < 3) clearH = 3;
+    tft.fillRect(x, 130 - clearH, barW, clearH, UI_CARD);
+    if (s == 0) {
+      tft.fillRect(x, 127, barW, 3, UI_BORDER);
+    } else {
+      tft.fillRect(x, 130 - h, barW, h, col);
+    }
+    radioBarH[i] = h;
+  }
+}
+
+void drawRadioStatus(uint32_t freqKHz, int16_t stationIdx, uint8_t stationCount,
+                     bool muted, bool stereo, uint8_t signal,
+                     bool scanning, uint32_t scanFreq, uint8_t scanFound, bool present) {
+  tft.fillRoundRect(8, 30, 224, 104, 6, UI_CARD);
+  tft.drawRoundRect(8, 30, 224, 104, 6, UI_BORDER);
+  radioBarCacheOk = false;  // 整卡重画：所有竖条都重画
+  uint32_t shown = scanning ? scanFreq : freqKHz;
+  radioDrawFreqArea(shown, muted, present);
+  radioDrawBadge(muted, present);
+  radioDrawStationLine(stationIdx, stationCount, present);
+  radioDrawInfoLine(scanning, scanFound, signal, stereo, present);
+  radioDrawBars(signal, muted, scanning, scanFreq, present);
+  rsLastShownFreq = shown;
+  rsLastIdx = stationIdx;
+  rsLastCount = stationCount;
+  rsLastMuted = muted;
+  rsLastPresent = present;
+  rsLastStereo = stereo;
+  rsLastScanning = scanning;
+  rsLastSignal = signal;
+  rsLastScanFreq = scanFreq;
+  rsLastFound = scanFound;
+}
+
+// 局部刷新：只重画发生变化的区域（每秒信号更新/搜台进度用），不整卡填充
+void updateRadioStatus(uint32_t freqKHz, int16_t stationIdx, uint8_t stationCount,
+                       bool muted, bool stereo, uint8_t signal,
+                       bool scanning, uint32_t scanFreq, uint8_t scanFound, bool present) {
+  uint32_t shown = scanning ? scanFreq : freqKHz;
+  bool badgeChanged = (muted != rsLastMuted) || (present != rsLastPresent);
+  bool freqChanged = (shown != rsLastShownFreq) || badgeChanged;
+  bool stationChanged = (stationIdx != rsLastIdx) || (stationCount != rsLastCount) || (present != rsLastPresent);
+  bool barsChanged = (signal != rsLastSignal) || (muted != rsLastMuted) ||
+                     (scanning != rsLastScanning) || (scanFreq != rsLastScanFreq) || (present != rsLastPresent);
+  if (freqChanged) radioDrawFreqArea(shown, muted, present);
+  if (badgeChanged) radioDrawBadge(muted, present);
+  if (stationChanged) radioDrawStationLine(stationIdx, stationCount, present);
+  // 信息行尽量只刷变化的那一小段，避免每秒清整行造成闪烁
+  if ((scanning != rsLastScanning) || (present != rsLastPresent)) {
+    radioDrawInfoLine(scanning, scanFound, signal, stereo, present);
+  } else if (scanning) {
+    if (scanFound != rsLastFound) {
+      tft.fillRect(16, 80, 150, 18, UI_CARD);
+      char b[40];
+      snprintf(b, sizeof(b), "搜台中 已存%u", scanFound);
+      printCN(16, 82, b, UI_ACCENT, UI_CARD, 1);
+    }
+  } else if (present) {
+    if (signal != rsLastSignal) {
+      tft.fillRect(16, 80, 112, 18, UI_CARD);
+      char b[24];
+      snprintf(b, sizeof(b), "信号 %u/15", signal);
+      printCN(16, 82, b, UI_MUTED, UI_CARD, 1);
+    }
+    if (stereo != rsLastStereo) {
+      tft.fillRect(168, 80, 56, 18, UI_CARD);
+      const char *st = stereo ? "立体声" : "单声道";
+      int16_t sw = cnTextWidth(st, 1);
+      printCN(224 - sw, 82, st, UI_MUTED, UI_CARD, 1);
+    }
+  }
+  if (barsChanged) radioDrawBars(signal, muted, scanning, scanFreq, present);
+  rsLastShownFreq = shown;
+  rsLastIdx = stationIdx;
+  rsLastCount = stationCount;
+  rsLastMuted = muted;
+  rsLastPresent = present;
+  rsLastStereo = stereo;
+  rsLastScanning = scanning;
+  rsLastSignal = signal;
+  rsLastScanFreq = scanFreq;
+  rsLastFound = scanFound;
+}
+
+// 收音机功能列表（5 行窗口，8 项滚动）
+void drawRadioList(uint8_t sel, uint8_t top, bool scanning, bool muted,
+                   int16_t stationIdx, uint8_t stationCount, bool present) {
+  static const char *items[RADIO_ITEM_COUNT] = {
+    "自动搜台", "静音切换", "上一个频道", "下一个频道",
+    "手动调频 -", "手动调频 +", "后台播放", "返回菜单"
+  };
+  for (uint8_t r = 0; r < RADIO_WIN_ROWS; r++) {
+    uint8_t idx = top + r;
+    int16_t y = 142 + r * 24;
+    bool isSel = (idx == sel);
+    uint16_t fill = isSel ? UI_SEL : UI_CARD;
+    uint16_t border = isSel ? UI_ACCENT : UI_BORDER;
+    tft.fillRoundRect(8, y, 224, 22, 6, fill);
+    tft.drawRoundRect(8, y, 224, 22, 6, border);
+    if (idx >= RADIO_ITEM_COUNT) continue;
+    printCN(16, y + 3, items[idx], ST77XX_WHITE, fill, 1);
+    char val[12] = "";
+    if (idx == 0) snprintf(val, sizeof(val), "%s", scanning ? "搜台中" : (stationCount ? "重搜" : "开始"));
+    else if (idx == 1) snprintf(val, sizeof(val), "%s", muted ? "静音" : "播放");
+    else if (idx == 2 || idx == 3) {
+      if (stationCount && stationIdx >= 0) snprintf(val, sizeof(val), "%d/%u", (int)stationIdx + 1, stationCount);
+      else snprintf(val, sizeof(val), "--");
+    }
+    else if (idx == 4) snprintf(val, sizeof(val), "-0.05");
+    else if (idx == 5) snprintf(val, sizeof(val), "+0.05");
+    else if (idx == 6) snprintf(val, sizeof(val), "%s", "保持");
+    else if (idx == 7) snprintf(val, sizeof(val), "%s", "静音");
+    if (!present) val[0] = '\0';
+    int16_t vw = cnTextWidth(val, 1);
+    printCN(216 - vw, y + 3, val, isSel ? UI_ACCENT : UI_MUTED, fill, 1);
+  }
+}
+
+void drawRadioScreen(uint32_t freqKHz, int16_t stationIdx, uint8_t stationCount,
+                     bool muted, bool stereo, uint8_t signal,
+                     bool scanning, uint32_t scanFreq, uint8_t scanFound,
+                     bool present, uint8_t sel, uint8_t top) {
+  tft.fillScreen(UI_BG);
+  uiTitle("收音机");
+  drawRadioStatus(freqKHz, stationIdx, stationCount, muted, stereo, signal,
+                  scanning, scanFreq, scanFound, present);
+  drawRadioList(sel, top, scanning, muted, stationIdx, stationCount, present);
+  printCN(8, 270, "KEY2 下 KEY3 上", UI_MUTED, UI_BG, 1);
+  printCN(8, 294, "KEY1执行 KEY4后台返回", UI_MUTED, UI_BG, 1);
 }

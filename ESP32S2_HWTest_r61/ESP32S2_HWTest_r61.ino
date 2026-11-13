@@ -1,6 +1,11 @@
 //================================================================
-// ESP32S2_HWTest_r60.ino
-// CoreBoard ESP32-S2 mini 硬件测试（r60：Deepseek 修改有时重启的问题：看门狗 reconfigure 到 10 秒、农历 HTTPS 改独立 12KB 任务、loop 栈提到 16KB）
+// ESP32S2_HWTest_r61.ino
+// CoreBoard ESP32-S2 mini 硬件测试
+// r61：setup/loop 重构为 FreeRTOS 多任务（appTask/netTask/sensorTask/lunarTask），
+//      UI 与网络/传感器解耦；配网改异步（不再阻塞网页 10 秒）；BMP085 与 I2C 寻址
+//      共用总线加互斥；跨任务共享字符串加锁；各业务任务独立喂狗。
+//      TEA5767 收音机（I2C 0x60，与 BMP085 共用 SDA33/SCL35）：硬件搜台/手动调谐/
+//      频道存 NVS，后台播放时首屏 KEY2/KEY3 切台；另加任务详情页、设备名网页可改。
 //
 // 相对 r42 的改动：
 //   1. 温度推送取消 0.5°C 阈值，改每 1 秒推一次当前值（BMP 温度与芯片温度都是）。
@@ -125,10 +130,20 @@
 //   （太长时只显示键名），查不到显示数值本身。
 //
 // ---- 多文件 ----
-//   本文件：状态机、按键、红外收发、主循环。
+//   本文件：状态机、按键、红外收发、FreeRTOS 任务。
 //   codes.h：灯（NEC）与空调（R05D）码表。
 //   ui.h：字库混排与全部屏幕绘制（含局部刷新）。
 //   cn6.h：16 点阵字库（与 r8/r9 相同）。
+//
+// ---- 任务框架（FreeRTOS，r61）----
+//   appTask   ：菜单状态机、按键扫描、红外收发、TFT 绘制、熄屏/呼吸灯（原 loop 主体）
+//   netTask   ：WiFi 状态与重连、WebServer、HomeSpan poll、家庭温度推送、异步配网
+//   sensorTask：BMP085 / 芯片温度 1 秒采样（I2C 总线互斥，支持热插拔）
+//   lunarTask ：农历 HTTPS（独立 12KB 栈，避免 TLS 栈溢出）
+//   跨任务：红外请求队列（网页/HomeKit 登记，appTask 统一执行，与按键同一上下文）、
+//           温度队列（sensorTask -> netTask）、共享字符串用 stateMutex 保护，
+//           WiFi/Web/HomeSpan 用 wifiMutex 串行化。ESP32-S2 为单核，
+//           任务按优先级调度：appTask(3) > netTask(2) > sensorTask(1)。
 //
 // ---- 引脚（来自原理图）----
 //   ST7789: CS=IO5  DC=IO3  RST=IO1  MOSI=IO11  SCK=IO7  BL=IO2  TE=IO12(不用)
@@ -143,9 +158,15 @@
 //   Adafruit ST7789 Library
 //   IRremoteESP8266（作者 David Conran，建议 2.8 以上）
 //
-// ---- 开发板设置 ----
+// ---- 开发板设置（r61 实测可用）----
 //   开发板选 "ESP32S2 Dev Module"；若串口无输出，把
-//   Tools > USB CDC On Boot 设为 Enabled 后重新上传
+//   Tools > USB CDC On Boot 设为 Enabled 后重新上传。
+//   本板芯片为 ESP32-S2FNR2（内置 4MB Flash + 2MB PSRAM）：
+//   - Tools > PSRAM 选 Enabled（r61 起必须；内部分配只够跑 5KB，开 PSRAM 后
+//     网页/HomeKit/WiFi 的大块内存走 PSRAM，内部堆留 17KB 给任务和协议栈）
+//   - Tools > Partition Scheme 选 "Huge APP (3MB No OTA/1MB SPIFFS)"
+//     （固件约 1.9MB，默认 1.2MB APP 分区放不下）
+//   上传端口：COM6（本机），原生 USB CDC，Upload Mode 选 Internal USB。
 //
 // ---- 其他说明 ----
 //   背光：原理图里 Q2 是低边开关、R2(10k)下拉到 GND，BL 高 -> 背光亮。
@@ -171,15 +192,16 @@
 #include <Wire.h>
 #include "driver/temperature_sensor.h"  // 芯片内核温度（S2 内置 TSENS，新版 IDF 驱动）
 #include "esp_task_wdt.h"  // 任务看门狗（r56：loop 卡死自动重启）
+#include "esp_heap_caps.h" // 内部分配/PSRAM 余量诊断
+#include "esp_system.h"    // 复位原因诊断
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "HomeSpan.h"
 #include "cn6.h"
 
-// loop 任务栈从 Arduino 默认 8KB 提到 16KB（上电随机重启的兜底：HomeSpan/网页/字符串
-//   深调用偶发栈溢出；HTTPS 已挪到独立任务，这里再留足余量）
-SET_LOOP_TASK_STACK_SIZE(16384);
+SET_LOOP_TASK_STACK_SIZE(8192);
 
 // ---------------- 引脚 ----------------
 #define TFT_CS    5
@@ -218,6 +240,53 @@ IRrecv  irrecv(IR_RX_PIN, 512);
 IRsend  irsend(IR_TX_PIN);
 decode_results irResults;
 
+// 红外接收头开关（幂等）：IRremoteESP8266 在 Arduino core 3.x 下每次
+// enableIRIn() 都会 timerBegin() 申请一个硬件定时器，S2 只有 4 个定时器；
+// 以前每次进灯/空调/解码/复制页都 enableIRIn()，进出 3~4 次定时器耗尽，
+// assert(timer != NULL) 直接 panic 重启（r61 实测复现）。用标志位只申请一次。
+volatile bool irReceiverOn = false;
+void enableIrReceiver() {
+  if (!irReceiverOn) {
+    irrecv.enableIRIn();
+    irReceiverOn = true;
+  }
+}
+void disableIrReceiver() {
+  if (irReceiverOn) {
+    irrecv.disableIRIn();
+    irReceiverOn = false;
+  }
+}
+
+// ---------------- FreeRTOS 跨任务通信 ----------------
+// 单核 S2：所有任务跑在同一个核上，靠优先级 + 阻塞让出 CPU。
+SemaphoreHandle_t stateMutex = nullptr;  // 跨任务共享字符串（lastSent/SSID/名称/配对码）
+SemaphoreHandle_t wifiMutex  = nullptr;  // WiFi/WebServer/HomeSpan 操作串行化
+SemaphoreHandle_t i2cMutex   = nullptr;  // BMP085 采样与 I2C 寻址共用总线
+SemaphoreHandle_t irReqMutex = nullptr;  // 红外请求队列的入队/去重
+QueueHandle_t     irReqQueue = nullptr;  // 网页/HomeKit -> appTask 待发红外
+QueueHandle_t     tempQueue  = nullptr;  // sensorTask -> netTask 温度推送
+QueueHandle_t     hsEvtQueue = nullptr;  // appTask -> netTask HomeKit 弹回
+QueueHandle_t     keyCmdQueue = nullptr; // 网页注入按键（/key?i=3）-> appTask
+TaskHandle_t      appTaskHandle    = nullptr;  // 诊断用（栈水位）
+TaskHandle_t      netTaskHandle    = nullptr;
+TaskHandle_t      sensorTaskHandle = nullptr;
+StaticTask_t      netTaskBuf, sensorTaskBuf, lunarTaskBuf;  // 静态 TCB（栈在 PSRAM）
+uint32_t dbgMemEntry = 0, dbgMemSync = 0, dbgMemTft = 0;  // 启动分段内存诊断
+volatile bool pairCodeDirty = false;     // 网页改了配对码，待 appTask 刷屏
+volatile bool copyNameDirty = false;     // 网页改了复制编号名，待 appTask 刷屏
+volatile bool sensorUpdated = false;     // sensorTask 更新了测量值
+volatile float chipTempC = 0.0f;         // 芯片内核温度（sensorTask 读，appTask 显示）
+volatile bool chipTempReadOk = false;    // 芯片温度至少读到过一次
+
+struct TempUpdate {  // sensorTask 每秒产出一帧，netTask 推给 HomeKit
+  bool  bmpValid;
+  float bmpC;
+  bool  chipValid;
+  float chipC;
+};
+enum HsEvent : uint8_t { HS_EVT_IR_SENT = 1 };
+
 const uint8_t keyPins[4] = {KEY1, KEY2, KEY3, KEY4};
 const char *keyNames[4]  = {"KEY1", "KEY2", "KEY3", "KEY4"};
 
@@ -225,7 +294,7 @@ const char *keyNames[4]  = {"KEY1", "KEY2", "KEY3", "KEY4"};
 #include "ui.h"
 
 // ---------------- 菜单状态 ----------------
-enum MenuState { ST_HOME, ST_MENU, ST_LAMP, ST_AC, ST_DECODE, ST_IRTEST, ST_WIFI, ST_ABOUT, ST_I2C, ST_COPY, ST_HS, ST_DISP, ST_CHIP };
+enum MenuState { ST_HOME, ST_MENU, ST_LAMP, ST_AC, ST_DECODE, ST_IRTEST, ST_WIFI, ST_TASKS, ST_RADIO, ST_ABOUT, ST_I2C, ST_COPY, ST_HS, ST_DISP, ST_CHIP };
 MenuState state = ST_HOME;
 uint8_t menuSel = 0;   // 一级菜单选择（0~11，12 项）
 uint8_t menuTop = 0;   // 一级菜单窗口顶行（可见 7 行，上限随 MENU_COUNT 动态算，空调页同款）
@@ -263,15 +332,14 @@ String   lastSent    = "--";   // 上次发送的键名（灯/空调子菜单底
 String   lastRecv    = "--";   // 最近一次接收（灯/空调子菜单底部显示）
 uint16_t recvBits    = 0;      // 接收到的位数
 uint16_t recvLen     = 0;      // 接收到的原始项数
-bool     screenDirty = true;
+volatile bool screenDirty = true;  // 由 appTask 消费；其它任务只置位
 // 熄屏（r46）：3 分钟无按键 -> 背光灭；任意按键唤醒（唤醒那一下只唤醒，不执行按键动作）
 bool     screenAsleep = false;
+volatile bool forceSleep = false;  // 调试：网页 /sleep 强制进入熄屏，测唤醒路径
 unsigned long lastKeyMs = 0;
 const unsigned long SCREEN_SLEEP_MS = 180000;  // 3 分钟
 unsigned long breathT0 = 0;      // 呼吸灯周期起点（熄屏时刻，周期 2s 从灭开始淡入）
 unsigned long lastBreathMs = 0;  // 呼吸灯上次写占空比（20ms 节流，写寄存器够用）
-
-unsigned long homeClockMs = 0;  // 首页时钟 1 秒刷新计时
 
 uint8_t       keyStable[4]  = {HIGH, HIGH, HIGH, HIGH};
 uint8_t       keyReading[4] = {HIGH, HIGH, HIGH, HIGH};
@@ -283,6 +351,27 @@ void applyLedCode(uint8_t v) {
   ledCode = v;
   digitalWrite(LED1, (v & 0x02) ? LED_ON : LED_OFF);  // LED1 = 高位
   digitalWrite(LED2, (v & 0x01) ? LED_ON : LED_OFF);  // LED2 = 低位
+}
+
+// ---------------- 跨任务共享字符串 ----------------
+// lastSent 由 appTask 写、网页（netTask）读，必须加锁（String 会重新分配内存）。
+void setLastSent(const String &s) {
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    lastSent = s;
+    xSemaphoreGive(stateMutex);
+  } else {
+    lastSent = s;
+  }
+}
+String getLastSent() {
+  String s;
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    s = lastSent;
+    xSemaphoreGive(stateMutex);
+  } else {
+    s = lastSent;
+  }
+  return s;
 }
 
 // ---------------- 红外发送 ----------------
@@ -335,8 +424,8 @@ void sendLampRaw(uint8_t idx) {
 // TFT 灯页：Raw + 设 lastSent + 只刷底部“发送:”行，不全屏
 void sendLamp(uint8_t idx) {
   sendLampRaw(idx);
-  lastSent = LAMP_CODES[idx].name;
-  updateSendLine(lastSent);
+  setLastSent(LAMP_CODES[idx].name);
+  updateSendLine(getLastSent());
 }
 
 // 发送空调码（R05D 构造发送）：Raw 版只发红外 + 串口，不碰屏幕
@@ -350,16 +439,16 @@ void sendAcRaw(uint8_t idx) {
 // TFT 空调页：Raw + 设 lastSent + 只刷底部“发送:”行
 void sendAc(uint8_t idx) {
   sendAcRaw(idx);
-  lastSent = AC_CODES[idx].name;
-  updateAcSendLine(lastSent);
+  setLastSent(AC_CODES[idx].name);
+  updateAcSendLine(getLastSent());
 }
 
 // 发送空调功能码（固定码，R05D 构造发送）
 void sendAcFunc(uint8_t idx) {
   // r58：撤销 r57 加的开关接收，发送时不关接收头，回波显示在接收行（与灯/空调其它发送一致）
   sendR05D(ACFUNC_CODES[idx].a, ACFUNC_CODES[idx].b, ACFUNC_CODES[idx].c);
-  lastSent = ACFUNC_CODES[idx].name;
-  updateAcSendLine(lastSent);  // 只刷底部卡片内“发送:”行，不全屏
+  setLastSent(ACFUNC_CODES[idx].name);
+  updateAcSendLine(getLastSent());  // 只刷底部卡片内“发送:”行，不全屏
   Serial.print("发送空调功能码: ");
   Serial.println(ACFUNC_CODES[idx].name);
 }
@@ -396,49 +485,43 @@ void sendAcStateRaw() {
 // TFT 空调页：Raw + 设 lastSent + 只刷底部“发送:”行
 void sendAcState(const char *action) {
   sendAcStateRaw();
-  lastSent = action;
-  updateAcSendLine(lastSent);
+  setLastSent(action);
+  updateAcSendLine(getLastSent());
 }
 
 // ---------------- 统一动作（TFT / HomeKit / 网页三路共用）----------------
-// 只改状态 + 发红外 + 串口 + lastSent，不碰屏幕。屏幕刷新由调用方负责：
-// TFT 在 dispatch 里同步刷行；HomeKit/网页置 hs*Dirty，由 loop 在对应页补刷。
+// 只改状态 + 发红外 + 串口 + lastSent，不碰屏幕（屏幕由 appTask 调用方刷新）。
 bool lightIsOn = false;  // 灯跟踪状态（开/关共用一个拨动码，靠它区分）
 // 灯码下标（codes.h 顺序：0 夜灯，1 开/关）
 const uint8_t LAMP_NIGHT_IDX = 0;
 const uint8_t LAMP_POWER_IDX = 1;
-// HomeKit/网页触发的发送：loop 补刷用（只在灯/空调页刷行，不在别页乱画）
-bool hsSentDirty = false;     // 发送行待刷
-bool hsAcStateDirty = false;  // 空调状态行待刷
 
-void actLampNight() { sendLampRaw(LAMP_NIGHT_IDX); lastSent = LAMP_CODES[LAMP_NIGHT_IDX].name; }
-void actLampOn()  { if (!lightIsOn) { sendLampRaw(LAMP_POWER_IDX); lightIsOn = true; } lastSent = "开"; }
-void actLampOff() { if (lightIsOn) { sendLampRaw(LAMP_POWER_IDX); lightIsOn = false; } lastSent = "关"; }
-void actAcOn()    { acTemp = 26; acFan = 4; acMode = 0; sendAcRaw(0); lastSent = AC_CODES[0].name; }
-void actAcOff()   { sendAcRaw(1); lastSent = AC_CODES[1].name; }
-void actAcTempUp()   { if (acTemp < 30) acTemp++; sendAcStateRaw(); lastSent = "温度+"; }
-void actAcTempDown() { if (acTemp > 17) acTemp--; sendAcStateRaw(); lastSent = "温度-"; }
-void actAcMode()     { acMode = (acMode + 1) % AC_MODE_COUNT; if (acMode == 0 || acMode == 2) acFan = 4; sendAcStateRaw(); lastSent = "模式循环"; }
-void actAcFanUp()    { acFan = (acFan + 1) % AC_FAN_COUNT; sendAcStateRaw(); lastSent = "风速+"; }
-void actAcFanDown()  { acFan = (acFan + AC_FAN_COUNT - 1) % AC_FAN_COUNT; sendAcStateRaw(); lastSent = "风速-"; }
+void actLampNight() { sendLampRaw(LAMP_NIGHT_IDX); setLastSent(LAMP_CODES[LAMP_NIGHT_IDX].name); }
+void actLampOn()  { if (!lightIsOn) { sendLampRaw(LAMP_POWER_IDX); lightIsOn = true; } setLastSent("开"); }
+void actLampOff() { if (lightIsOn) { sendLampRaw(LAMP_POWER_IDX); lightIsOn = false; } setLastSent("关"); }
+void actAcOn()    { acTemp = 26; acFan = 4; acMode = 0; sendAcRaw(0); setLastSent(AC_CODES[0].name); }
+void actAcOff()   { sendAcRaw(1); setLastSent(AC_CODES[1].name); }
+void actAcTempUp()   { if (acTemp < 30) acTemp++; sendAcStateRaw(); setLastSent("温度+"); }
+void actAcTempDown() { if (acTemp > 17) acTemp--; sendAcStateRaw(); setLastSent("温度-"); }
+void actAcMode()     { acMode = (acMode + 1) % AC_MODE_COUNT; if (acMode == 0 || acMode == 2) acFan = 4; sendAcStateRaw(); setLastSent("模式循环"); }
+void actAcFanUp()    { acFan = (acFan + 1) % AC_FAN_COUNT; sendAcStateRaw(); setLastSent("风速+"); }
+void actAcFanDown()  { acFan = (acFan + AC_FAN_COUNT - 1) % AC_FAN_COUNT; sendAcStateRaw(); setLastSent("风速-"); }
 
-// 网页/HomeKit 的红外登记制：回调里只登记、不直接发红外，loop 在
-// 同一位置统一执行（与按键同一上下文）。人手点按速度远低于 loop
-// 速度，单槽“后到覆盖先到”够用；若同一轮里登记两次，只执行最后一次。
+// 网页/HomeKit 的红外登记制（FreeRTOS 队列版）：回调里只入队、不直接发红外，
+//   appTask 在统一位置执行（与按键同一上下文）。队列由 irReqMutex 保护：
+//   - 去重：同一动作已在队里（还没发）就合并丢弃（家庭 App 一次点按会重复写 HAP）。
+//   - 延后 500ms 发送，等网络安静；隔开点按仍各发各的。
 enum PendingIr : uint8_t {
   PENDING_NONE, PENDING_LAMP_NIGHT, PENDING_LAMP_ON, PENDING_LAMP_OFF,
   PENDING_AC_ON, PENDING_AC_OFF, PENDING_AC_TEMP_UP, PENDING_AC_TEMP_DOWN,
   PENDING_AC_MODE, PENDING_AC_FAN_UP, PENDING_AC_FAN_DOWN
 };
-SpanCharacteristic *pendingRevert = nullptr;  // 待弹回的瞬时按键特征（loop 里 setVal，勿在 update 里做）
-// 网页/HomeKit 红外排队：登记时记时间，loop 里等网络安静（500ms）再发，
-//   快点多次按顺序全发（单槽后到覆盖先到会丢动作）。按键不走排队。
+SpanCharacteristic *pendingRevert = nullptr;  // 待弹回的瞬时按键特征（netTask 里 setVal）
 #define PENDING_QUEUE_LEN 8
 #define PENDING_SEND_DELAY_MS 500
 struct PendingItem { uint8_t action; bool stateDirty; unsigned long at; };
-PendingItem pendingQueue[PENDING_QUEUE_LEN];
-uint8_t pendingHead = 0, pendingCount = 0;
-const char *pendingName(uint8_t a) {  // 排队日志用可读动作名（串口确认一次点按只排一次）
+uint16_t pendingMask = 0;  // 已在队里的动作位图（去重）
+const char *pendingName(uint8_t a) {  // 排队日志用可读动作名
   switch (a) {
     case PENDING_LAMP_NIGHT: return "灯夜灯";
     case PENDING_LAMP_ON: return "灯开";
@@ -453,42 +536,42 @@ const char *pendingName(uint8_t a) {  // 排队日志用可读动作名（串口
     default: return "未知";
   }
 }
-void requestIr(uint8_t p, bool stateDirty) {  // 不用 PendingIr：Arduino 自动原型插在 enum 前会报未声明
-  // 去重：同一动作已在队里（还没发）就合并丢弃——家庭 App 一次点按可能触发多次
-  //   HAP 写入（重试），不合并会连发多次；快速连点同一按钮（<500ms，上一发还没出队）
-  //   也会合并成一次，这是故意的；隔开点按（上一发已出队）仍各发各的。
-  for (uint8_t i = 0; i < pendingCount; i++) {
-    uint8_t idx = (pendingHead + i) % PENDING_QUEUE_LEN;
-    if (pendingQueue[idx].action == p) {
-      Serial.print("红外请求已合并（同动作还在队里）：");
-      Serial.println(pendingName(p));
-      return;
-    }
+void requestIr(uint8_t p, bool stateDirty) {  // 可由网页/HomeKit 任务调用
+  if (!irReqQueue || !irReqMutex) return;
+  if (xSemaphoreTake(irReqMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  if (pendingMask & (1u << p)) {
+    xSemaphoreGive(irReqMutex);
+    Serial.print("红外请求已合并（同动作还在队里）：");
+    Serial.println(pendingName(p));
+    return;
   }
-  if (pendingCount >= PENDING_QUEUE_LEN) {
+  if (uxQueueSpacesAvailable(irReqQueue) == 0) {
+    xSemaphoreGive(irReqMutex);
     Serial.println("待发队列已满，丢弃本次红外请求");
     return;
   }
-  uint8_t tail = (pendingHead + pendingCount) % PENDING_QUEUE_LEN;
-  pendingQueue[tail].action = p;
-  pendingQueue[tail].stateDirty = stateDirty;
-  pendingQueue[tail].at = millis();
-  pendingCount++;
-  Serial.print("红外请求已排队：");
-  Serial.print(pendingName(p));
-  Serial.print("（队列 ");
-  Serial.print(pendingCount);
-  Serial.println("）");
+  PendingItem it = {p, stateDirty, millis()};
+  if (xQueueSend(irReqQueue, &it, 0) == pdPASS) {
+    pendingMask |= (1u << p);
+    Serial.print("红外请求已排队：");
+    Serial.print(pendingName(p));
+    Serial.print("（队里 ");
+    Serial.print(uxQueueMessagesWaiting(irReqQueue));
+    Serial.println(" 条）");
+  }
+  xSemaphoreGive(irReqMutex);
 }
+// appTask 每轮调用：队首满 500ms 就取出执行，并同步刷新当前页的行。
 void execPendingIr() {
-  if (pendingCount == 0) return;
-  PendingItem &it = pendingQueue[pendingHead];
-  if (millis() - it.at < PENDING_SEND_DELAY_MS) return;  // 等网络安静
-  uint8_t a = it.action;
-  bool sd = it.stateDirty;
-  pendingHead = (pendingHead + 1) % PENDING_QUEUE_LEN;
-  pendingCount--;
-  switch (a) {
+  if (!irReqQueue || !irReqMutex) return;
+  if (xSemaphoreTake(irReqMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+  PendingItem it;
+  if (xQueuePeek(irReqQueue, &it, 0) != pdPASS) { xSemaphoreGive(irReqMutex); return; }
+  if (millis() - it.at < PENDING_SEND_DELAY_MS) { xSemaphoreGive(irReqMutex); return; }
+  xQueueReceive(irReqQueue, &it, 0);
+  pendingMask &= ~(1u << it.action);
+  xSemaphoreGive(irReqMutex);
+  switch (it.action) {
     case PENDING_LAMP_NIGHT: actLampNight(); break;
     case PENDING_LAMP_ON: actLampOn(); break;
     case PENDING_LAMP_OFF: actLampOff(); break;
@@ -501,8 +584,16 @@ void execPendingIr() {
     case PENDING_AC_FAN_DOWN: actAcFanDown(); break;
     default: break;
   }
-  hsSentDirty = true;
-  if (sd) hsAcStateDirty = true;
+  // 网页/HomeKit 触发的发送：当前在灯/空调页就同步刷行（appTask 持有屏幕）
+  if (state == ST_LAMP) {
+    updateSendLine(getLastSent());
+  } else if (state == ST_AC) {
+    updateAcSendLine(getLastSent());
+    if (it.stateDirty) updateAcStatusLine(buildAcStatus());
+  }
+  // 通知 netTask 弹回 HomeKit 瞬时按键（setVal 必须回 poll 所在任务做）
+  uint8_t evt = HS_EVT_IR_SENT;
+  if (hsEvtQueue) xQueueSend(hsEvtQueue, &evt, 0);
 }
 
 // 清除解码显示（红外解码子菜单）
@@ -585,8 +676,15 @@ String copyHex(uint64_t v, uint8_t bits) {
 
 // 由当前复制状态生成 5 行屏显串（进入页、换编号、学习、解析、存储、发射后调用）。
 void refreshCopyLines() {
+  String slotName;  // 名称可能被网页任务改写，取快照
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    slotName = copyName[copySel];
+    xSemaphoreGive(stateMutex);
+  } else {
+    slotName = copyName[copySel];
+  }
   copySlotLine = String("编号 ") + copySel;
-  if (copyName[copySel].length()) copySlotLine += " " + copyName[copySel];
+  if (slotName.length()) copySlotLine += " " + slotName;
   copyModeLine = String("模式 ") + (copyLearning ? "学习中" : "空闲");
   copyStatusLine = copyStatus;
   if (copyHas[copySel]) copyStoredLine = String("已存 ") + copyProto[copySel] + " " + copyHex(copyValue[copySel], copyBits[copySel]);
@@ -627,27 +725,30 @@ bool copySendSlot(uint8_t slot) {
   if (!copyHas[slot]) return false;
   String proto = copyProto[slot];
   uint64_t v = copyValue[slot];
-  irrecv.disableIRIn();
+  disableIrReceiver();
   if (proto == "NEC") {
     irsend.sendNEC((uint32_t)v, copyBits[slot]);
   } else if (proto == "COOLIX") {
     uint32_t code = (uint32_t)(v & 0xFFFFFF);
     sendR05D((uint8_t)(code >> 16), (uint8_t)(code >> 8), (uint8_t)code);
   } else {
-    irrecv.enableIRIn();
+    enableIrReceiver();
     return false;
   }
-  irrecv.enableIRIn();
+  enableIrReceiver();
   return true;
 }
 
 // ---------------- WiFi 网页配置 ----------------
 WebServer wifiServer(8080);  // 不用 80：HomeSpan 的 HomeKit 服务（HAP）占着 80
 Preferences wifiPrefs;
-bool wifiApOn = false;
-bool webEnabled = true;  // 网页总开关（RAM，重启默认开；WiFi 页 KEY2 切换）
+volatile bool wifiApOn = false;
+volatile bool webEnabled = true;  // 网页总开关（RAM，重启默认开；WiFi 页 KEY1 切换）
 String wifiSavedSsid = "";
 String wifiSavedPass = "";
+// 异步配网状态（wifiHandleSave 只发起连接，netTask 负责等结果/关热点）
+volatile bool wifiConnecting = false;
+volatile unsigned long wifiConnectStart = 0;
 
 // 前置声明（wifiHandleSave 里调用 wifiStopAp，定义在后）
 void wifiStartAp();
@@ -675,6 +776,8 @@ String htmlEscape(const String &s) {
 // 开机读出后调 setPairingCode，网页改码后也立即调一次（重启后确保生效）。
 // 注意：改码只影响下次重新添加配件，已配对的不受影响；码必须是 8 位数字。
 String curPairCode = "46637726";  // 开机后由 loadPairCode 从 NVS 覆盖
+String gDeviceName = "ESP32-S2-IR";  // 首屏名称（NVS cfg/name，网页可改，掉电保存）
+volatile bool devNameDirty = false;  // 网页改了设备名，待 appTask 刷首屏
 // 编译时间：__DATE__="Oct 29 2026" → "26/10/29:E"（:E 是固定结尾，不是星期也不是时刻）
 //   （__DATE__ 的日为个位数时前面补空格，atoi 跳过空格照算）
 String gBuildTime = "";
@@ -701,6 +804,95 @@ void loadPairCode() {
   bool ok = (saved.length() == 8);
   for (uint8_t k = 0; ok && k < 8; k++) if (saved[k] < '0' || saved[k] > '9') ok = false;
   if (ok) curPairCode = saved;
+}
+
+// 首屏设备名（NVS 命名空间 cfg，键 name；默认 ESP32-S2-IR）
+void loadDeviceName() {
+  Preferences prefs;
+  prefs.begin("cfg", true);
+  String saved = prefs.getString("name", "");
+  prefs.end();
+  saved.trim();
+  if (saved.length()) gDeviceName = saved;
+}
+void saveDeviceName(const String &nm) {
+  Preferences prefs;
+  prefs.begin("cfg", false);
+  prefs.putString("name", nm);
+  prefs.end();
+}
+
+// 跨任务共享字符串访问（wifiSavedSsid/copyName/curPairCode 由 netTask 写、appTask 读）
+void setWifiSavedCreds(const String &ssid, const String &pass) {
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    wifiSavedSsid = ssid;
+    wifiSavedPass = pass;
+    xSemaphoreGive(stateMutex);
+  } else {
+    wifiSavedSsid = ssid;
+    wifiSavedPass = pass;
+  }
+}
+void getWifiSavedCreds(String &ssid, String &pass) {
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    ssid = wifiSavedSsid;
+    pass = wifiSavedPass;
+    xSemaphoreGive(stateMutex);
+  } else {
+    ssid = wifiSavedSsid;
+    pass = wifiSavedPass;
+  }
+}
+String getWifiSavedSsid() {
+  String s, p;
+  getWifiSavedCreds(s, p);
+  return s;
+}
+String getNameCopy(uint8_t slot) {
+  String s;
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    s = copyName[slot];
+    xSemaphoreGive(stateMutex);
+  } else {
+    s = copyName[slot];
+  }
+  return s;
+}
+void setNameCopy(uint8_t slot, const String &nm) {
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    copyName[slot] = nm;
+    xSemaphoreGive(stateMutex);
+  } else {
+    copyName[slot] = nm;
+  }
+}
+String getPairCode() {
+  String s;
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    s = curPairCode;
+    xSemaphoreGive(stateMutex);
+  } else {
+    s = curPairCode;
+  }
+  return s;
+}
+String getDeviceName() {
+  String s;
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    s = gDeviceName;
+    xSemaphoreGive(stateMutex);
+  } else {
+    s = gDeviceName;
+  }
+  return s;
+}
+void setDeviceName(const String &nm) {
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    gDeviceName = nm;
+    xSemaphoreGive(stateMutex);
+  } else {
+    gDeviceName = nm;
+  }
 }
 
 // 显示设置掩码（默认 31 全显示，存 NVS disp/mask）：bit0=时间，bit1=年/月，
@@ -745,7 +937,7 @@ String wifiPageHtml() {
     "button{width:100%;padding:14px;margin-top:14px;background:#1f7ae0;color:#fff;border:0;border-radius:10px;font-size:16px}</style></head><body>"
     "<h2>ESP32-S2 红外控制</h2>"
     "<div class=\"card\"><p>当前状态：" + sta + "</p>"
-    "<p>上次发送：" + htmlEscape(lastSent) + "</p></div>"
+    "<p>上次发送：" + htmlEscape(getLastSent()) + "</p></div>"
     "<div class=\"card\"><h3>灯</h3><div class=\"btns\">"
     "<a class=\"btn\" href=\"/ir?cmd=lamp_night\">夜灯</a>"
     "<a class=\"btn\" href=\"/ir?cmd=lamp_on\">开</a>"
@@ -761,22 +953,46 @@ String wifiPageHtml() {
     "<p class=\"note\">按钮通过设备红外发射，需对准灯/空调。</p></div>"
     "<div class=\"card\"><h3>WiFi 设置</h3>"
     "<form method=\"post\" action=\"/save\">"
-    "<label>WiFi 名称（SSID）</label><input name=\"ssid\" value=\"" + htmlEscape(wifiSavedSsid) + "\" required>"
+    "<label>WiFi 名称（SSID）</label><input name=\"ssid\" value=\"" + htmlEscape(getWifiSavedSsid()) + "\" required>"
     "<label>密码</label><input type=\"password\" name=\"pass\" required>"
     "<button type=\"submit\">保存并连接</button></form>"
     "<p class=\"note\">保存后设备会尝试连接，成功后配置热点自动关闭。</p></div>";
   h += "<div class=\"card\"><h3>红外复制编号命名</h3><form method=\"post\" action=\"/ircopy_name\">";
   for (uint8_t s = 1; s <= 10; s++) {
-    h += "<label>编号 " + String(s) + "</label><input name=\"n" + String(s) + "\" maxlength=\"8\" value=\"" + htmlEscape(copyName[s]) + "\">";
+    h += "<label>编号 " + String(s) + "</label><input name=\"n" + String(s) + "\" maxlength=\"8\" value=\"" + htmlEscape(getNameCopy(s)) + "\">";
   }
   h += "<button type=\"submit\">保存名称</button></form>"
     "<p class=\"note\">名称显示在设备的红外复制页（编号旁），不影响已存键码。</p></div>";
+  h += "<div class=\"card\"><h3>首屏设备名称</h3><form method=\"post\" action=\"/devname\">"
+    "<label>显示在屏幕左上角（最长 16 字符）</label><input name=\"name\" maxlength=\"16\" value=\"" + htmlEscape(getDeviceName()) + "\" required>"
+    "<button type=\"submit\">保存名称</button></form>"
+    "<p class=\"note\">立即生效并写入 NVS，掉电不丢；只改首屏标题，不改 HomeKit 名称。</p></div>";
   h += "<div class=\"card\"><h3>HomeSpan 配对码</h3><form method=\"post\" action=\"/paircode\">"
-    "<label>配对码（8 位数字）</label><input name=\"paircode\" maxlength=\"8\" value=\"" + htmlEscape(curPairCode) + "\">"
+    "<label>配对码（8 位数字）</label><input name=\"paircode\" maxlength=\"8\" value=\"" + htmlEscape(getPairCode()) + "\">"
     "<button type=\"submit\">保存配对码</button></form>"
     "<p class=\"note\">改码只影响下次重新添加配件（已配对的不受影响）；重启后确保生效。</p></div></body></html>";
   return h;
 }
+
+// 隐藏调试接口：模拟按 KEY1~KEY4（i=0..3），用于远程/自动化测试菜单路径。
+// 只入队，真正执行仍在 appTask（与物理按键同一上下文）。
+void wifiHandleKey() {
+  int i = wifiServer.arg("i").toInt();
+  if (i >= 0 && i < 4 && keyCmdQueue) {
+    uint8_t k = (uint8_t)i;
+    xQueueSend(keyCmdQueue, &k, 0);
+    wifiServer.send(200, "text/plain", "ok");
+  } else {
+    wifiServer.send(400, "text/plain", "bad");
+  }
+}
+
+// 调试：强制熄屏（验证 3 分钟熄屏/按键唤醒路径，不用真等 3 分钟）
+void wifiHandleSleep() {
+  forceSleep = true;
+  wifiServer.send(200, "text/plain", "sleeping");
+}
+
 
 void wifiHandleRoot() { wifiServer.send(200, "text/html", wifiPageHtml()); }
 void wifiHandleWifi() {  // “/wifi”已并入根页，旧地址 302 回根页
@@ -801,34 +1017,27 @@ void wifiHandleIr() {
   wifiServer.send(302, "text/plain", "");
 }
 
+// WiFi 保存改为异步（r61）：以前在请求里 while 等 10 秒，期间整个网页/HomeSpan
+//   都停摆；现在只保存 + 发起连接 + 立即返回“连接中”页（6 秒后自动回首页），
+//   连接结果由 netTask 监视：成功则关热点并刷屏，失败则保留热点可重试。
 void wifiHandleSave() {
   String ssid = wifiServer.arg("ssid");
   String pass = wifiServer.arg("pass");
   ssid.trim();  // SSID 两端空格通常是误输入，去掉
-  wifiSavedSsid = ssid; wifiSavedPass = pass;
+  setWifiSavedCreds(ssid, pass);
   wifiPrefs.putString("ssid", ssid);
   wifiPrefs.putString("pass", pass);
-  // 保持热点开着（以便回传结果），尝试连接，最多等 10 秒
   WiFi.begin(ssid, pass);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { esp_task_wdt_reset(); delay(500); }  // r56：等连接时喂狗，防看门狗误触发
-  if (WiFi.status() == WL_CONNECTED) {
-    String body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-      "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head><body>"
-      "<h2>连接成功</h2><p>网络：" + htmlEscape(ssid) + "</p><p>IP：" + WiFi.localIP().toString() + "</p>"
-      "<p>配置热点即将关闭，可在设备 WiFi 页查看状态。</p></body></html>";
-    wifiServer.send(200, "text/html", body);
-    delay(1000);  // 让结果页发出去再关热点
-    wifiStopAp();
-    screenDirty = true;
-  } else {
-    String body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-      "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head><body>"
-      "<h2>连接失败</h2><p>已保存，但连不上（请检查名称/密码）。</p>"
-      "<p><a href=\"/\">返回重填</a></p></body></html>";
-    wifiServer.send(200, "text/html", body);
-    screenDirty = true;  // 热点保持开启，可在原页重试
-  }
+  wifiConnecting = true;
+  wifiConnectStart = millis();
+  String body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<meta http-equiv=\"refresh\" content=\"6;url=/\"></head><body>"
+    "<h2>已保存，正在连接</h2><p>网络：" + htmlEscape(ssid) + "</p>"
+    "<p>连接成功后配置热点会自动关闭；6 秒后自动返回首页查看状态。</p>"
+    "<p><a href=\"/\">立即返回</a></p></body></html>";
+  wifiServer.send(200, "text/html", body);
+  Serial.println("WiFi: 已保存 " + ssid + "，后台连接中");
 }
 
 // 红外复制编号命名保存（POST /ircopy_name）：10 个名称同时写 NVS 与内存，
@@ -841,10 +1050,28 @@ void wifiHandleCopyName() {
     String nm = wifiServer.arg(key.c_str());
     nm.trim();
     prefs.putString(key.c_str(), nm);
-    copyName[s] = nm;
+    setNameCopy(s, nm);  // 加锁写内存；屏由 appTask 收到 copyNameDirty 后刷新
   }
   prefs.end();
-  if (state == ST_COPY) { refreshCopyLines(); screenDirty = true; }
+  copyNameDirty = true;
+  wifiServer.sendHeader("Location", "/");
+  wifiServer.send(302, "text/plain", "");
+}
+
+// 首屏设备名称保存（POST /devname）：trim + UTF-8 安全截断到 32 字节，
+// 写 NVS 与内存，首屏在 appTask 收到 devNameDirty 后立即重画。
+void wifiHandleDevName() {
+  String nm = wifiServer.arg("name");
+  nm.trim();
+  if (!nm.length()) nm = "ESP32-S2-IR";
+  if (nm.length() > 32) {
+    int cut = 32;
+    while (cut > 0 && ((uint8_t)nm[cut] & 0xC0) == 0x80) cut--;  // 不截断 UTF-8 中间
+    nm = nm.substring(0, cut);
+  }
+  saveDeviceName(nm);
+  setDeviceName(nm);
+  devNameDirty = true;
   wifiServer.sendHeader("Location", "/");
   wifiServer.send(302, "text/plain", "");
 }
@@ -866,26 +1093,47 @@ void wifiHandlePairCode() {
   prefs.begin("hk", false);
   prefs.putString("pair", code);
   prefs.end();
-  curPairCode = code;
-  homeSpan.setPairingCode(code.c_str());
-  if (state == ST_HS) screenDirty = true;
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    curPairCode = code;
+    xSemaphoreGive(stateMutex);
+  } else {
+    curPairCode = code;
+  }
+  homeSpan.setPairingCode(code.c_str());  // 与 poll 同任务（netTask），无并发
+  pairCodeDirty = true;  // appTask 在 HomeSpan 页时刷屏
   wifiServer.sendHeader("Location", "/");
   wifiServer.send(302, "text/plain", "");
 }
 
+// 网页监听状态：以前只在开热点时才 begin()，家里 WiFi 连上后 8080 实际没监听；
+//   r61 改为开机就起（STA 模式也能用网页），启停都记状态避免重复 begin。
+volatile bool webServerStarted = false;
+void ensureWebServer() {
+  if (webEnabled && !webServerStarted) {
+    wifiServer.begin();
+    webServerStarted = true;
+  }
+}
+
+// WiFi/网页操作加锁：appTask（按键开关热点/网页）与 netTask（WebServer/HomeSpan）
+//   可能并发，softAP/server 的启停必须串行，否则会把监听套接字拆在半路。
 void wifiStartAp() {
+  if (wifiMutex) xSemaphoreTake(wifiMutex, portMAX_DELAY);
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP("ESP32S2-Setup");
-  if (webEnabled) wifiServer.begin();  // 网页关着时不开监听，免得偷偷重起服务
+  ensureWebServer();  // 网页关着时不开监听，免得偷偷重起服务
   wifiApOn = true;
+  if (wifiMutex) xSemaphoreGive(wifiMutex);
   Serial.println("WiFi 配置热点已开启：ESP32S2-Setup，网页（控制+WiFi配置同页） " + WiFi.softAPIP().toString() + ":8080");
 }
 
 void wifiStopAp() {
+  if (wifiMutex) xSemaphoreTake(wifiMutex, portMAX_DELAY);
   wifiServer.close();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   wifiApOn = false;
+  if (wifiMutex) xSemaphoreGive(wifiMutex);
   Serial.println("WiFi 配置热点已关闭");
 }
 
@@ -893,24 +1141,28 @@ void wifiStopAp() {
 //   否则浏览器悬着的连接会攒下来拖慢主循环。路由注册不受 stop/begin 影响。
 void setWebEnabled(bool on) {
   if (on == webEnabled) return;
+  if (wifiMutex) xSemaphoreTake(wifiMutex, portMAX_DELAY);
   webEnabled = on;
   if (on) {
-    wifiServer.begin();  // 重起监听（关掉期间的重试已被拒，不会攒半截连接）
+    ensureWebServer();  // 重起监听（关掉期间的重试已被拒，不会攒半截连接）
     Serial.println("网页服务已开启");
   } else {
     wifiServer.close();  // 先断当前客户端
     wifiServer.stop();   // 再停监听
+    webServerStarted = false;
     Serial.println("网页服务已关闭（重启后默认恢复开启）");
   }
+  if (wifiMutex) xSemaphoreGive(wifiMutex);
   screenDirty = true;
 }
 
 // WiFi 页显示（状态/网络/IP/两行提示，由当前 WiFi 状态拼出）
 void showWifiScreen() {
   String status, ssid, ip, tip1, tip2;
+  String savedSsid = getWifiSavedSsid();  // 网页任务可能改写，取快照
   if (wifiApOn) {
     status = "状态: 配置热点已开启";
-    ssid = "网络: " + (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : (wifiSavedSsid.length() ? wifiSavedSsid : "无"));
+    ssid = "网络: " + (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : (savedSsid.length() ? savedSsid : "无"));
     ip = "AP IP: " + WiFi.softAPIP().toString();
     tip1 = "连热点 ESP32S2-Setup";
     tip2 = WiFi.softAPIP().toString() + ":8080";  // 只放地址（加“浏览器打开”会超宽）
@@ -922,7 +1174,7 @@ void showWifiScreen() {
     tip2 = "";
   } else {
     status = "状态: 未连接";
-    ssid = "网络: " + (wifiSavedSsid.length() ? wifiSavedSsid : "无");
+    ssid = "网络: " + (savedSsid.length() ? savedSsid : "无");
     ip = "IP: -";
     tip1 = "按 KEY2 开启配置热点";
     tip2 = "";
@@ -1027,9 +1279,12 @@ bool chipTempOk = false;
 bool hsStarted = false;
 
 void setupHomeSpan() {
-  homeSpan.setPairingCode(curPairCode.c_str());
+  String pair = getPairCode();
+  String ssid, pass;
+  getWifiSavedCreds(ssid, pass);
+  homeSpan.setPairingCode(pair.c_str());
   homeSpan.setQRID("HOMESPAN");
-  homeSpan.setWifiCredentials(wifiSavedSsid.c_str(), wifiSavedPass.c_str());
+  homeSpan.setWifiCredentials(ssid.c_str(), pass.c_str());
   homeSpan.begin(Category::Other, "ESP32S2-IR");
   // 配件 1：灯
   new SpanAccessory();
@@ -1110,8 +1365,7 @@ uint16_t bmpAC4, bmpAC5, bmpAC6;
 bool bmpPresent = false;
 int32_t bmpTempTenths = 0;  // 温度，0.1°C 单位
 int32_t bmpPressPa = 0;     // 气压，Pa
-unsigned long bmpLastRead = 0;
-unsigned long chipLastRefresh = 0;  // 芯片详情页卡片刷新计时（1 秒）
+
 
 // 读 16 位（MSB 在前）；两字节分开读（不写进同一表达式，免求值顺序不定）。
 // 返回 false 表示总线失败。
@@ -1420,6 +1674,8 @@ uint8_t i2cFoundCount = 0;
 bool    i2cScanned = false;  // 是否已扫过一次（未扫时显示“按 KEY1 开始寻址”）
 
 void scanI2c() {
+  // 与 sensorTask 的 BMP085 采样共用总线，必须互斥（否则扫描期间采样会插进来）
+  if (i2cMutex) xSemaphoreTake(i2cMutex, portMAX_DELAY);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);
   i2cFoundCount = 0;
@@ -1429,13 +1685,14 @@ void scanI2c() {
       i2cFound[i2cFoundCount++] = addr;
     }
   }
+  if (i2cMutex) xSemaphoreGive(i2cMutex);
   i2cScanned = true;
   screenDirty = true;
 }
 
 // ---------------- 屏幕刷新 ----------------
 // 芯片详情（r55）：RAM=堆（ESP.getHeapSize/getFreeHeap），ROM=Flash（程序大小/Flash 容量），
-//   温度=现读 TSENS（与 1c 家庭推送同一次读数口径，不存全局量）；PSRAM 本板没有，不显示
+//   温度用 sensorTask 每秒采到的值（TSENS 只在 sensorTask 里读，避免并发访问驱动）
 void chipStrings(String &chip, String &ram, String &ramPct, String &rom, String &romPct, String &temp) {
   chip = "芯片: " + String(ESP.getChipModel());
   size_t heapTotal = ESP.getHeapSize();
@@ -1448,37 +1705,509 @@ void chipStrings(String &chip, String &ram, String &ramPct, String &rom, String 
   String flashStr = (flash % 1048576 == 0) ? String(flash / 1048576) + "MB" : String(flash / 1048576.0, 1) + "MB";
   rom = "ROM: " + String(sketch / 1048576.0, 1) + "MB/" + flashStr;
   romPct = "ROM 占用 " + String(flash ? (sketch * 100 / flash) : 0) + "%";
-  float tempC = 0;
-  if (chipTempOk && temperature_sensor_get_celsius(chipTempHandle, &tempC) == ESP_OK) {
-    temp = "芯片温度 " + String(tempC, 1) + "度";
+  if (chipTempOk && chipTempReadOk) {
+    temp = "芯片温度 " + String(chipTempC, 1) + "度";
   } else {
     temp = "芯片温度 --";
   }
 }
+// 上次复位原因（芯片详情页显示，r61 诊断用）：能区分上电/软复位/Panic/看门狗/欠压
+String gResetReason = "";
+String fmtResetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "复位 上电";
+    case ESP_RST_EXT:       return "复位 外部";
+    case ESP_RST_SW:        return "复位 软复位";
+    case ESP_RST_PANIC:     return "复位 Panic";
+    case ESP_RST_INT_WDT:   return "复位 中断狗";
+    case ESP_RST_TASK_WDT:  return "复位 任务狗";
+    case ESP_RST_WDT:       return "复位 看门狗";
+    case ESP_RST_DEEPSLEEP: return "复位 深睡";
+    case ESP_RST_BROWNOUT:  return "复位 欠压";
+    case ESP_RST_SDIO:      return "复位 SDIO";
+    default:                return "复位 未知";
+  }
+}
+
 void refreshChipCard() {  // 芯片页 1 秒刷新：只刷卡片（值是实时读的），不清屏
   String chip, ram, ramPct, rom, romPct, temp;
   chipStrings(chip, ram, ramPct, rom, romPct, temp);
-  drawChipCard(chip, ram, ramPct, rom, romPct, temp);
+  drawChipCard(chip, ram, ramPct, rom, romPct, temp, gResetReason);
+}
+
+// ---------------- 任务详情（FreeRTOS 实时状态）----------------
+#define TASKS_MAX 24
+TaskViewRow taskRows[TASKS_MAX];
+uint8_t taskRowCount = 0;
+uint8_t tasksTop = 0;
+uint8_t tasksCpu = 0;
+uint32_t tasksHeapK = 0;
+struct PrevRunTip { char name[12]; uint32_t counter; };
+PrevRunTip prevRuns[TASKS_MAX];
+uint8_t prevRunCount = 0;
+uint64_t prevRunUs = 0;
+
+static const char *taskStateText(eTaskState st) {
+  switch (st) {
+    case eRunning:   return "运";
+    case eReady:     return "就";
+    case eBlocked:   return "阻";
+    case eSuspended: return "挂";
+    case eDeleted:   return "删";
+    default:         return "?";
+  }
+}
+static uint16_t taskStateColor(eTaskState st) {
+  switch (st) {
+    case eRunning:   return UI_GREEN;
+    case eReady:     return UI_ACCENT;
+    case eBlocked:   return UI_MUTED;
+    case eSuspended: return UI_AMBER;
+    case eDeleted:   return ST77XX_RED;
+    default:         return UI_MUTED;
+  }
+}
+
+// 采集一次任务状态：状态/优先级/栈余/CPU（运行时间统计已开启，esp_timer 微秒）。
+// CPU% = 本秒任务运行时间增量 / 本秒真实经过时间；总 CPU = 100 - IDLE 占用。
+void refreshTaskRows() {
+  static TaskStatus_t st[TASKS_MAX];
+  configRUN_TIME_COUNTER_TYPE totalRt = 0;
+  uint64_t nowUs = esp_timer_get_time();
+  UBaseType_t n = uxTaskGetSystemState(st, TASKS_MAX, &totalRt);
+  if (n > TASKS_MAX) n = TASKS_MAX;
+  bool hadPrev = (prevRunUs != 0);
+  uint64_t elapsed = (hadPrev && nowUs > prevRunUs) ? (uint64_t)(nowUs - prevRunUs) : 0;
+  uint8_t idleCpu = 0;
+  bool idleSeen = false;
+  for (UBaseType_t i = 0; i < n; i++) {
+    TaskViewRow &r = taskRows[i];
+    snprintf(r.name, sizeof(r.name), "%.10s", st[i].pcTaskName ? st[i].pcTaskName : "?");
+    r.state = taskStateText(st[i].eCurrentState);
+    r.stateColor = taskStateColor(st[i].eCurrentState);
+    r.prio = (uint8_t)st[i].uxCurrentPriority;
+    uint32_t hwm = uxTaskGetStackHighWaterMark(st[i].xHandle);  // 字节
+    r.stackK = (uint16_t)(hwm / 1024);
+    if (elapsed) {
+      uint32_t cur = (uint32_t)st[i].ulRunTimeCounter;
+      uint32_t delta = 0;
+      for (uint8_t p = 0; p < prevRunCount; p++) {
+        if (strncmp(prevRuns[p].name, r.name, sizeof(r.name)) == 0) {
+          delta = cur - prevRuns[p].counter;  // U32 微秒，自然回绕
+          break;
+        }
+      }
+      uint32_t pct = (uint32_t)((uint64_t)delta * 100 / elapsed);
+      if (pct > 100) pct = 100;
+      if (strncmp(r.name, "IDLE", 4) == 0) { idleCpu = (uint8_t)pct; idleSeen = true; }
+    }
+  }
+  // 按优先级从高到低排序，便于查看
+  for (UBaseType_t a = 0; a < n; a++) {
+    for (UBaseType_t b = a + 1; b < n; b++) {
+      if (taskRows[b].prio > taskRows[a].prio) {
+        TaskViewRow t = taskRows[a]; taskRows[a] = taskRows[b]; taskRows[b] = t;
+      }
+    }
+  }
+  // 保存本帧运行时间，下一帧算 CPU
+  for (UBaseType_t i = 0; i < n; i++) {
+    snprintf(prevRuns[i].name, sizeof(prevRuns[i].name), "%.10s", st[i].pcTaskName ? st[i].pcTaskName : "?");
+    prevRuns[i].counter = (uint32_t)st[i].ulRunTimeCounter;
+  }
+  prevRunCount = (uint8_t)n;
+  prevRunUs = nowUs;
+  taskRowCount = (uint8_t)n;
+  tasksCpu = (hadPrev && idleSeen) ? (uint8_t)(100 - idleCpu) : 0;
+  tasksHeapK = ESP.getFreeHeap() / 1024;
+  uint8_t maxTop = (taskRowCount > TASK_WIN_ROWS) ? (taskRowCount - TASK_WIN_ROWS) : 0;
+  if (tasksTop > maxTop) tasksTop = maxTop;
+}
+
+// ---------------- TEA5767 收音机 ----------------
+#define RADIO_ADDR        0x60
+#define RADIO_MIN_KHZ     87500
+#define RADIO_MAX_KHZ     108000
+#define RADIO_MANUAL_STEP 50     // 手动细调 0.05MHz
+#define RADIO_SEARCH_POLL_MS     30    // 硬件 Search 状态轮询
+#define RADIO_SEARCH_TIMEOUT_MS  4000  // 单次搜索超时
+#define RADIO_VERIFY_WAIT_MS     120   // 搜到后正常调谐复核等待
+#define RADIO_SEARCH_STEP_KHZ    200   // 下一次搜索从当前台 +0.2MHz 开始
+#define RADIO_SIGNAL_MIN  8            // ADC 信号阈值 0~15（高门限，滤掉雪花台）
+#define RADIO_MAX_STATIONS 30
+
+uint32_t radioStations[RADIO_MAX_STATIONS];
+uint8_t radioStationCount = 0;
+int16_t radioStationIdx = -1;      // 当前在保存列表中的下标，-1=手动频率
+uint32_t radioFreqKHz = 98000;
+bool radioMuted = true;
+bool radioBackground = false;      // 后台播放（在首屏显示频率、KEY2/3 切台）
+bool radioPresent = false;
+bool radioStereo = false;
+uint8_t radioSignal = 0;
+uint8_t radioSel = 0;              // 收音机功能菜单选择
+uint8_t radioTop = 0;
+bool radioScanning = false;
+uint32_t radioScanFreq = RADIO_MIN_KHZ;
+unsigned long radioScanWaitMs = 0;
+uint32_t radioScanFound[RADIO_MAX_STATIONS];
+uint8_t radioScanFoundCount = 0;
+unsigned long radioDrawMs = 0;
+enum RadioScanPhase : uint8_t { RSCAN_IDLE, RSCAN_SEARCH, RSCAN_VERIFY };
+RadioScanPhase radioScanPhase = RSCAN_IDLE;
+uint32_t radioSearchStartKHz = RADIO_MIN_KHZ;
+uint32_t radioScanCandidate = 0;
+
+bool radioI2cTake() {
+  return !i2cMutex || xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(200)) == pdTRUE;
+}
+void radioI2cGive() {
+  if (i2cMutex) xSemaphoreGive(i2cMutex);
+}
+
+// 读 5 字节状态：b[0]&0x3F/b[1]=PLL，b[2] bit7=立体声，b[3] 高 4 位=信号强度
+bool radioReadStatus(uint8_t *b) {
+  if (!radioI2cTake()) return false;
+  bool ok = false;
+  if (Wire.requestFrom(RADIO_ADDR, (uint8_t)5) == 5) {
+    for (uint8_t i = 0; i < 5; i++) b[i] = Wire.read();
+    ok = true;
+  }
+  radioI2cGive();
+  return ok;
+}
+
+// 写 5 字节：PLL14 位 + 静音位；0x11=PORT1高+高边注入，0x1E=32.768k晶振+软静音+高切+立体声降噪
+bool radioWritePll(uint32_t freqKHz, bool muted) {
+  if (!radioI2cTake()) return false;
+  uint32_t pll = ((uint32_t)(freqKHz + 225) * 4000) / 32768;
+  uint8_t b[5];
+  b[0] = (muted ? 0x80 : 0x00) | ((pll >> 8) & 0x3F);
+  b[1] = pll & 0xFF;
+  b[2] = 0x11;
+  b[3] = 0x1E;
+  b[4] = 0x00;
+  Wire.beginTransmission(RADIO_ADDR);
+  for (uint8_t i = 0; i < 5; i++) Wire.write(b[i]);
+  bool ok = (Wire.endTransmission() == 0);
+  radioI2cGive();
+  return ok;
+}
+
+bool radioProbe() {
+  if (!radioI2cTake()) return false;
+  Wire.beginTransmission(RADIO_ADDR);
+  bool ok = (Wire.endTransmission() == 0);
+  radioI2cGive();
+  return ok;
+}
+
+// 读一次信号/立体声/实际频率（非搜台时同步当前频率）
+bool radioPollStatus() {
+  uint8_t b[5];
+  if (!radioReadStatus(b)) return false;
+  radioSignal = (b[3] & 0xF0) >> 4;
+  radioStereo = (b[2] & 0x80) != 0;
+  if (!radioScanning) {
+    uint16_t pll = ((uint16_t)(b[0] & 0x3F) << 8) | b[1];
+    uint32_t fHz = (uint32_t)pll * 32768UL / 4;
+    if (fHz >= 225000) {
+      uint32_t khz = (fHz - 225000) / 1000;
+      if (khz >= RADIO_MIN_KHZ && khz <= RADIO_MAX_KHZ) {
+        radioFreqKHz = (uint32_t)(((khz + RADIO_MANUAL_STEP / 2) / RADIO_MANUAL_STEP) * RADIO_MANUAL_STEP);
+      }
+    }
+  }
+  return true;
+}
+
+int16_t radioStationIndexAt(uint32_t f) {
+  for (uint8_t i = 0; i < radioStationCount; i++) {
+    int32_t d = (int32_t)f - (int32_t)radioStations[i];
+    if (d < 0) d = -d;
+    if (d <= 25) return i;
+  }
+  return -1;
+}
+
+void radioSetFrequency(uint32_t f, bool updateIdx) {
+  if (f < RADIO_MIN_KHZ) f = RADIO_MIN_KHZ;
+  if (f > RADIO_MAX_KHZ) f = RADIO_MAX_KHZ;
+  radioFreqKHz = (uint32_t)(((f + RADIO_MANUAL_STEP / 2) / RADIO_MANUAL_STEP) * RADIO_MANUAL_STEP);
+  radioWritePll(radioFreqKHz, radioMuted);
+  if (updateIdx) radioStationIdx = radioStationIndexAt(radioFreqKHz);
+}
+
+void radioSelectStation(int8_t dir) {
+  if (radioStationCount == 0) return;
+  if (radioStationIdx < 0) radioStationIdx = (dir >= 0) ? 0 : (int16_t)radioStationCount - 1;
+  else radioStationIdx = (radioStationIdx + dir + radioStationCount) % radioStationCount;
+  radioSetFrequency(radioStations[radioStationIdx], false);
+  radioStationIdx = (radioStationIdx + radioStationCount) % radioStationCount;
+  Serial.printf("[RADIO] station %d/%u %u.%02uMHz mute=%d\n",
+                (int)radioStationIdx + 1, radioStationCount,
+                radioFreqKHz / 1000, (radioFreqKHz % 1000) / 10, radioMuted);
+}
+
+void radioManualStep(int8_t dir) {
+  int32_t f = (int32_t)radioFreqKHz + dir * RADIO_MANUAL_STEP;
+  radioSetFrequency((uint32_t)f, true);
+}
+
+void radioSaveStations() {
+  Preferences prefs;
+  prefs.begin("radio", false);
+  size_t a = prefs.putUChar("n", radioStationCount);
+  size_t b = 0;
+  if (radioStationCount) b = prefs.putBytes("f", radioStations, radioStationCount * sizeof(radioStations[0]));
+  prefs.end();
+  Serial.printf("[RADIO] save n=%u a=%u b=%u\n", radioStationCount, (unsigned)a, (unsigned)b);
+}
+void radioLoadStations() {
+  Preferences prefs;
+  prefs.begin("radio", true);
+  uint8_t n = prefs.getUChar("n", 0);
+  if (n > RADIO_MAX_STATIONS) n = 0;
+  if (n) {
+    size_t got = prefs.getBytes("f", radioStations, n * sizeof(radioStations[0]));
+    if (got != n * sizeof(radioStations[0])) n = 0;
+  }
+  prefs.end();
+  Serial.printf("[RADIO] load raw n=%u s0=%u\n", n, n ? radioStations[0] : 0);
+  for (uint8_t i = 0; i < n; i++) {
+    if (radioStations[i] < RADIO_MIN_KHZ || radioStations[i] > RADIO_MAX_KHZ) { n = 0; break; }
+  }
+  radioStationCount = n;
+  radioStationIdx = n ? 0 : -1;
+  radioFreqKHz = n ? radioStations[0] : 98000;
+  Serial.printf("[RADIO] load final n=%u f0=%u freq=%u\n", radioStationCount, n ? radioStations[0] : 0, radioFreqKHz);
+}
+
+void radioRedrawStatus() {
+  // 局部刷新：进入/换页的全屏绘制用 drawRadioStatus（整卡一次），
+  // 这里只更新变化区域，避免每秒/搜台时上半卡闪烁。
+  updateRadioStatus(radioFreqKHz, radioStationIdx, radioStationCount, radioMuted, radioStereo,
+                    radioSignal, radioScanning, radioScanFreq, radioScanFoundCount, radioPresent);
+}
+void radioRedrawList() {
+  drawRadioList(radioSel, radioTop, radioScanning, radioMuted, radioStationIdx, radioStationCount, radioPresent);
+}
+void radioRedrawAll() { radioRedrawStatus(); radioRedrawList(); }
+
+// 启动芯片硬件 Search（向上、高电平门限），从 startKHz 开始
+bool radioSearchStart(uint32_t startKHz) {
+  if (!radioI2cTake()) return false;
+  uint32_t pll = ((uint32_t)(startKHz + 225) * 4000) / 32768;
+  uint8_t b[5];
+  b[0] = 0x80 | 0x40 | ((pll >> 8) & 0x3F);  // MUTE + SEARCH + PLL 高 6 位
+  b[1] = pll & 0xFF;
+  b[2] = 0x80 | 0x60 | 0x10;                 // SEARCH_UP + 高电平门限 + 高边注入
+  b[3] = 0x1E;                               // 32.768k 晶振 + 软静音 + 高切 + 立体声降噪
+  b[4] = 0x00;
+  Wire.beginTransmission(RADIO_ADDR);
+  for (uint8_t i = 0; i < 5; i++) Wire.write(b[i]);
+  bool ok = (Wire.endTransmission() == 0);
+  radioI2cGive();
+  return ok;
+}
+
+// 从读状态字节解析 PLL 频率（kHz，50kHz 对齐；无效返回 0）
+uint32_t radioReadFreqKHz(const uint8_t *b) {
+  uint16_t pll = ((uint16_t)(b[0] & 0x3F) << 8) | b[1];
+  uint32_t fHz = (uint32_t)pll * 32768UL / 4;
+  if (fHz < 225000) return 0;
+  uint32_t khz = (fHz - 225000) / 1000;
+  if (khz < RADIO_MIN_KHZ || khz > RADIO_MAX_KHZ) return 0;
+  return ((khz + RADIO_MANUAL_STEP / 2) / RADIO_MANUAL_STEP) * RADIO_MANUAL_STEP;
+}
+
+// 自动搜台（r62）：用 TEA5767 硬件 Search（向上、高电平门限）找台，
+//   找到后正常调谐 120ms 复核信号，只保存强台；下一次从当前台 +0.2MHz 继续。
+//   这样不会把手动步进扫到的噪声/偏频点存进频道表（雪花台的根因）。
+void radioScanStart() {
+  if (!radioPresent) return;
+  radioScanning = true;
+  radioScanPhase = RSCAN_SEARCH;
+  radioSearchStartKHz = RADIO_MIN_KHZ;
+  radioScanFreq = RADIO_MIN_KHZ;
+  radioScanCandidate = 0;
+  radioScanFoundCount = 0;
+  radioMuted = true;
+  radioSearchStart(radioSearchStartKHz);
+  radioScanWaitMs = millis();
+  radioDrawMs = 0;
+  Serial.println("收音机: 开始自动搜台（硬件 Search 高门限）");
+  screenDirty = true;
+}
+void radioScanFinish() {
+  if (!radioScanning) return;
+  radioScanning = false;
+  radioScanPhase = RSCAN_IDLE;
+  radioStationCount = radioScanFoundCount;
+  for (uint8_t i = 0; i < radioStationCount; i++) radioStations[i] = radioScanFound[i];
+  radioSaveStations();
+  if (radioStationCount) {
+    radioStationIdx = 0;
+    radioFreqKHz = radioStations[0];
+    radioMuted = false;
+    radioWritePll(radioFreqKHz, false);
+  } else {
+    radioStationIdx = -1;
+    radioMuted = true;
+    radioWritePll(radioFreqKHz, true);
+  }
+  radioSignal = 0;
+  radioStereo = false;
+  Serial.printf("收音机: 搜台完成，共 %u 台\n", radioStationCount);
+  screenDirty = true;
+}
+void radioScanTick(unsigned long now) {
+  if (!radioScanning) return;
+  if (now - radioScanWaitMs < RADIO_SEARCH_POLL_MS) return;
+  uint8_t b[5];
+  if (radioScanPhase == RSCAN_SEARCH) {
+    if (!radioReadStatus(b)) return;
+    if (b[0] & 0x80) {  // READY：搜索结束
+      bool bandLimit = (b[0] & 0x40) != 0;
+      uint32_t f = radioReadFreqKHz(b);
+      if (bandLimit || f == 0) { radioScanFinish(); return; }
+      radioScanCandidate = f;
+      radioScanFreq = f;
+      radioWritePll(f, true);  // 退出 Search，正常调谐到候选台（保持静音）
+      radioScanPhase = RSCAN_VERIFY;
+      radioScanWaitMs = now;
+    } else if (now - radioScanWaitMs > RADIO_SEARCH_TIMEOUT_MS) {
+      Serial.println("收音机: 搜索超时，提前结束");
+      radioScanFinish();
+      return;
+    }
+  } else if (radioScanPhase == RSCAN_VERIFY) {
+    if (now - radioScanWaitMs < RADIO_VERIFY_WAIT_MS) return;
+    uint8_t sig = 0;
+    if (radioReadStatus(b)) {
+      sig = (b[3] & 0xF0) >> 4;
+      radioSignal = sig;
+      radioStereo = (b[2] & 0x80) != 0;
+    }
+    if (sig >= RADIO_SIGNAL_MIN && radioScanFoundCount < RADIO_MAX_STATIONS) {
+      bool dup = false;
+      for (uint8_t i = 0; i < radioScanFoundCount; i++) {
+        int32_t d = (int32_t)radioScanCandidate - (int32_t)radioScanFound[i];
+        if (d < 0) d = -d;
+        if (d < 300) { dup = true; break; }
+      }
+      if (!dup) {
+        radioScanFound[radioScanFoundCount++] = radioScanCandidate;
+        Serial.printf("[RADIO] found %u.%02uMHz sig=%u\n",
+                      radioScanCandidate / 1000, (radioScanCandidate % 1000) / 10, sig);
+      }
+    }
+    uint32_t next = radioScanCandidate + RADIO_SEARCH_STEP_KHZ;
+    if (next > RADIO_MAX_KHZ) { radioScanFinish(); return; }
+    radioSearchStartKHz = next;
+    radioScanFreq = next;
+    if (!radioSearchStart(next)) { radioScanFinish(); return; }
+    radioScanPhase = RSCAN_SEARCH;
+    radioScanWaitMs = now;
+  }
+  if (state == ST_RADIO && (radioDrawMs == 0 || now - radioDrawMs >= 250)) {
+    radioDrawMs = now;
+    radioRedrawStatus();  // 只刷状态卡；列表在开始时/结束后重画
+  }
+}
+
+void radioInit() {
+  if (i2cMutex && xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setClock(100000);
+    xSemaphoreGive(i2cMutex);
+  }
+  radioPresent = radioProbe();
+  if (radioPresent) {
+    radioWritePll(radioFreqKHz, true);  // 开机静音，进收音机页后由用户切换
+    Serial.printf("[RADIO] TEA5767 已连接：%u.%02uMHz，已存 %u 台\n",
+                  radioFreqKHz / 1000, (radioFreqKHz % 1000) / 10, radioStationCount);
+  } else {
+    Serial.println("[RADIO] 未检测到 TEA5767（检查 I2C 0x60 / SDA33 / SCL35）");
+  }
+}
+
+// 首屏后台播放提示（不含音量，只有频率/序号/静音）
+String radioHomeLine() {
+  if (!radioBackground) return "";
+  char b[48];
+  snprintf(b, sizeof(b), "FM %u.%02uMHz", radioFreqKHz / 1000, (radioFreqKHz % 1000) / 10);
+  String s = b;
+  if (radioStationCount) {
+    s += " ";
+    if (radioStationIdx >= 0) s += String(radioStationIdx + 1);
+    else s += "--";
+    s += "/";
+    s += String(radioStationCount);
+  }
+  if (radioMuted) s += " 静音";
+  return s;
+}
+
+// 调试：收音机状态 + NVS 原始值（排查保存/加载）
+void wifiHandleRadioDbg() {
+  Preferences p;
+  p.begin("radio", true);
+  uint8_t n = p.getUChar("n", 0);
+  uint32_t tmp[RADIO_MAX_STATIONS] = {0};
+  size_t got = 0;
+  if (n && n <= RADIO_MAX_STATIONS) got = p.getBytes("f", tmp, sizeof(tmp));
+  p.end();
+  char b[300];
+  snprintf(b, sizeof(b),
+           "present=%d stations=%u idx=%d freq=%u mute=%d bg=%d scanning=%d scanFreq=%u found=%u nvsN=%u got=%u nvs0=%u\n",
+           radioPresent, radioStationCount, (int)radioStationIdx, radioFreqKHz, radioMuted,
+           radioBackground, radioScanning, radioScanFreq, radioScanFoundCount,
+           n, (unsigned)got, n ? tmp[0] : 0);
+  wifiServer.send(200, "text/plain", b);
+}
+
+// 调试：清空收音机保存列表并静音
+void wifiHandleRadioClear() {
+  Preferences p;
+  p.begin("radio", false);
+  p.putUChar("n", 0);
+  p.end();
+  radioStationCount = 0;
+  radioStationIdx = -1;
+  radioFreqKHz = 98000;
+  radioMuted = true;
+  radioBackground = false;
+  radioScanning = false;
+  radioWritePll(radioFreqKHz, true);
+  screenDirty = true;
+  wifiServer.send(200, "text/plain", "radio cleared");
 }
 
 void drawScreen() {
   switch (state) {
-    case ST_HOME: refreshHomeData(); drawHomeScreen(homeMode, homeClock, homeYday, homeBmpTemp, homeBmpPress, homeCalMonth, homeCalDates, homeCalTodayIdx, homeLunar, dispMask); syncHomeLines(); break;
+    case ST_HOME: refreshHomeData(); drawHomeScreen(homeMode, homeClock, homeYday, homeBmpTemp, homeBmpPress, homeCalMonth, homeCalDates, homeCalTodayIdx, homeLunar, dispMask, getDeviceName(), radioHomeLine()); syncHomeLines(); break;
     case ST_MENU: fixMenuState(); drawMenuScreen(menuSel, menuTop); break;
     case ST_LAMP: drawLampScreen(lampSel, lastSent, lastRecv); break;
     case ST_AC: drawAcScreen(acSel, acTop, lastSent, lastRecv, buildAcStatus()); break;
     case ST_DECODE: drawDecodeScreen(irRxProto, irRxHex, recvBits, recvLen); break;
     case ST_IRTEST: drawIrTestScreen(irTestRunning, irTestOnPhase); break;
     case ST_WIFI: showWifiScreen(); break;
+    case ST_TASKS: drawTasksScreen(taskRows, taskRowCount, tasksTop, tasksCpu, tasksHeapK); break;
+    case ST_RADIO:
+      drawRadioScreen(radioFreqKHz, radioStationIdx, radioStationCount, radioMuted, radioStereo,
+                      radioSignal, radioScanning, radioScanFreq, radioScanFoundCount,
+                      radioPresent, radioSel, radioTop);
+      break;
     case ST_ABOUT: drawAboutScreen(gBuildTime); break;
     case ST_I2C: drawI2cScreen(i2cScanned, i2cFound, i2cFoundCount); break;
     case ST_COPY: drawCopyScreen(copySlotLine, copyModeLine, copyStatusLine, copyStoredLine, copyLearnedLine); break;
-    case ST_HS: drawHsScreen(fmtPairCode(curPairCode)); break;
+    case ST_HS: drawHsScreen(fmtPairCode(getPairCode())); break;
     case ST_DISP: drawDispScreen(dispSel, dispMask); break;
     case ST_CHIP: {  // 进页整屏重画（值现算）；页内 1 秒刷新只刷卡片（见 loop 1d）
       String chip, ram, ramPct, rom, romPct, temp;
       chipStrings(chip, ram, ramPct, rom, romPct, temp);
-      drawChipScreen(chip, ram, ramPct, rom, romPct, temp);
+      drawChipScreen(chip, ram, ramPct, rom, romPct, temp, gResetReason);
       break;
     }
   }
@@ -1501,7 +2230,14 @@ void onKeyPressed(uint8_t i) {
 
   switch (state) {
     case ST_HOME:
-      if (i == 3) { state = ST_MENU; screenDirty = true; }  // KEY4 -> 一级菜单（其他键只更新指示灯，不刷屏）
+      if (i == 3) {
+        state = ST_MENU;
+        screenDirty = true;  // KEY4 -> 一级菜单
+      } else if (radioBackground && (i == 1 || i == 2)) {
+        // 收音机后台播放：首屏 KEY2/KEY3 直接上/下一个频道，只刷提示行
+        radioSelectStation(i == 1 ? 1 : -1);
+        updateHomeRadioLine(radioHomeLine());
+      }
       break;
     case ST_MENU:
       fixMenuState();  // r56 防御：先钳制状态再切换，防越界行绘制
@@ -1530,19 +2266,32 @@ void onKeyPressed(uint8_t i) {
         Serial.print("菜单 -> "); Serial.print(menuSel); Serial.print("/"); Serial.print(MENU_COUNT); Serial.print(" top="); Serial.println(menuTop);
       }
       else if (i == 0) {  // KEY1 确认 -> 进入子菜单
-        // r57：进灯/空调/解码/复制页时强制重开接收头，防接收头被某条发送路径关掉后没开回来
+        // r61：接收头改成幂等开关，反复进出子菜单不会再重复申请硬件定时器
         switch (menuSel) {
-          case 0: state = ST_LAMP; irrecv.enableIRIn(); break;
-          case 1: state = ST_AC; irrecv.enableIRIn(); break;
-          case 2: state = ST_DECODE; irrecv.enableIRIn(); break;
+          case 0: state = ST_LAMP; enableIrReceiver(); break;
+          case 1: state = ST_AC; enableIrReceiver(); break;
+          case 2: state = ST_DECODE; enableIrReceiver(); break;
           case 3: state = ST_IRTEST; break;
           case 4: state = ST_WIFI; break;
           case 5: state = ST_I2C; break;
-          case 6: state = ST_COPY; irrecv.enableIRIn(); refreshCopyLines(); break;
+          case 6: state = ST_COPY; enableIrReceiver(); refreshCopyLines(); break;
           case 7: state = ST_HS; break;
           case 8: state = ST_DISP; break;
-          case 9: state = ST_ABOUT; break;
-          case 10: state = ST_CHIP; break;
+          case 9: refreshTaskRows(); tasksTop = 0; state = ST_TASKS; break;
+          case 10: state = ST_ABOUT; break;
+          case 11: state = ST_CHIP; break;
+          case 12: {  // 收音机：进页重新探测模块，切前台
+            radioPresent = radioProbe();
+            if (radioPresent) radioPollStatus();
+            radioSel = 0;
+            radioTop = 0;
+            radioBackground = false;
+            state = ST_RADIO;
+            Serial.printf("[RADIO] page present=%d stations=%u freq=%u.%02u\n",
+                          radioPresent, radioStationCount,
+                          radioFreqKHz / 1000, (radioFreqKHz % 1000) / 10);
+            break;
+          }
           default: state = ST_HOME; break;  // 返回
         }
         screenDirty = true;
@@ -1642,6 +2391,86 @@ void onKeyPressed(uint8_t i) {
     case ST_CHIP:  // 芯片详情是纯显示页，只有 KEY4 回菜单
       if (i == 3) { state = ST_MENU; screenDirty = true; }
       break;
+    case ST_TASKS:  // 任务详情：KEY2/KEY3 滚动列表，KEY4 回菜单
+      if (i == 1) {
+        if (taskRowCount > TASK_WIN_ROWS && tasksTop + TASK_WIN_ROWS < taskRowCount) {
+          tasksTop++;
+          drawTasksCard(taskRows, taskRowCount, tasksTop, tasksCpu);
+        }
+      } else if (i == 2) {
+        if (tasksTop > 0) {
+          tasksTop--;
+          drawTasksCard(taskRows, taskRowCount, tasksTop, tasksCpu);
+        }
+      } else if (i == 3) {
+        state = ST_MENU;
+        screenDirty = true;
+      }
+      break;
+    case ST_RADIO:
+      if (i == 1) {  // KEY2：下一功能
+        radioSel = (radioSel + 1) % RADIO_ITEM_COUNT;
+        if (radioSel == 0) radioTop = 0;
+        else if (radioSel >= radioTop + RADIO_WIN_ROWS) radioTop = radioSel - RADIO_WIN_ROWS + 1;
+        radioRedrawList();
+      } else if (i == 2) {  // KEY3：上一功能
+        radioSel = (radioSel + RADIO_ITEM_COUNT - 1) % RADIO_ITEM_COUNT;
+        if (radioSel == RADIO_ITEM_COUNT - 1) radioTop = RADIO_ITEM_COUNT - RADIO_WIN_ROWS;
+        else if (radioSel < radioTop) radioTop = radioSel;
+        radioRedrawList();
+      } else if (i == 0) {  // KEY1：执行当前功能
+        switch (radioSel) {
+          case 0:  // 自动搜台（再按一次提前结束）
+            if (radioScanning) radioScanFinish();
+            else radioScanStart();
+            radioRedrawAll();
+            break;
+          case 1:  // 静音/取消静音
+            if (!radioScanning) {
+              radioMuted = !radioMuted;
+              radioWritePll(radioFreqKHz, radioMuted);
+              radioRedrawAll();
+            }
+            break;
+          case 2:  // 上一个频道
+            if (!radioScanning) { radioSelectStation(-1); radioRedrawAll(); }
+            break;
+          case 3:  // 下一个频道
+            if (!radioScanning) { radioSelectStation(1); radioRedrawAll(); }
+            break;
+          case 4:  // 手动调频 -
+            if (!radioScanning) { radioManualStep(-1); radioRedrawAll(); }
+            break;
+          case 5:  // 手动调频 +
+            if (!radioScanning) { radioManualStep(1); radioRedrawAll(); }
+            break;
+          case 6:  // 后台播放：保持播放并回菜单
+            if (radioScanning) radioScanFinish();
+            radioBackground = true;
+            state = ST_MENU;
+            screenDirty = true;
+            Serial.printf("[RADIO] background %u.%02uMHz idx=%d/%u mute=%d\n",
+                          radioFreqKHz / 1000, (radioFreqKHz % 1000) / 10,
+                          (int)radioStationIdx, radioStationCount, radioMuted);
+            break;
+          case 7:  // 返回菜单：静音并回菜单
+            if (radioScanning) radioScanFinish();
+            radioMuted = true;
+            radioWritePll(radioFreqKHz, true);
+            radioBackground = false;
+            state = ST_MENU;
+            screenDirty = true;
+            Serial.println("[RADIO] return + mute");
+            break;
+        }
+      } else if (i == 3) {  // KEY4：默认后台播放并回菜单（保持当前播放/静音状态）
+        if (radioScanning) radioScanFinish();
+        radioBackground = true;
+        state = ST_MENU;
+        screenDirty = true;
+        Serial.println("[RADIO] key4 background");
+      }
+      break;
     case ST_I2C:
       if (i == 0) { scanI2c(); }  // KEY1 -> 寻址（scanI2c 内置 screenDirty）
       else if (i == 3) { state = ST_MENU; screenDirty = true; }  // KEY4 -> 回菜单
@@ -1711,29 +2540,434 @@ void onKeyPressed(uint8_t i) {
   }
 }
 
+// 按键事件统一入口：物理扫描与网页注入共用（含熄屏唤醒逻辑）
+void handleKeyEvent(uint8_t i, unsigned long now) {
+  lastKeyMs = now;  // 任意按键都算一次操作，刷新熄屏计时
+  if (screenAsleep) {
+    // 唤醒：关呼吸 PWM，恢复按键指示灯 + 开背光 + 整屏重画（唤醒这一下不执行按键动作）
+    ledcDetach(LED1);
+    ledcDetach(LED2);
+    pinMode(LED1, OUTPUT);
+    pinMode(LED2, OUTPUT);
+    applyLedCode(ledCode);  // 恢复熄屏前的按键指示（ledCode 由 applyLedCode 维护）
+    digitalWrite(TFT_BL, BL_ON);
+    screenAsleep = false;
+    screenDirty = true;
+  } else {
+    onKeyPressed(i);   // 按下（低电平）才动作
+  }
+}
+
 void pollKeys(unsigned long now) {
   for (uint8_t i = 0; i < 4; i++) {
     uint8_t r = digitalRead(keyPins[i]);
     if (r != keyReading[i]) { keyReading[i] = r; keyT[i] = now; }
     if ((now - keyT[i] > DEBOUNCE_MS) && (keyReading[i] != keyStable[i])) {
       keyStable[i] = keyReading[i];
-      if (keyStable[i] == LOW) {
-        lastKeyMs = now;  // 任意按键都算一次操作，刷新熄屏计时
-        if (screenAsleep) {
-          // 唤醒：关呼吸 PWM，恢复按键指示灯 + 开背光 + 整屏重画（唤醒这一下不执行按键动作）
-          ledcDetach(LED1);
-          ledcDetach(LED2);
-          pinMode(LED1, OUTPUT);
-          pinMode(LED2, OUTPUT);
-          applyLedCode(ledCode);  // 恢复熄屏前的按键指示（ledCode 由 applyLedCode 维护）
-          digitalWrite(TFT_BL, BL_ON);
-          screenAsleep = false;
-          screenDirty = true;
-        } else {
-          onKeyPressed(i);   // 按下（低电平）才动作
-        }
+      if (keyStable[i] == LOW) handleKeyEvent(i, now);
+    }
+  }
+}
+
+// ---------------- FreeRTOS 任务 ----------------
+// 临时诊断开关：1 = 开机前 30 秒自动模拟按 KEY4/KEY2/KEY3（复现上电按键重启）
+#define AUTO_KEY_STRESS 0
+
+// 首页局部刷新：联网/断网切换、模式变化时全屏重画；同模式下每秒只刷变化的
+//   行/卡（不全屏）：时钟模式走 updateHomeClockLines，同步中只刷温压卡。
+static void tickHomeScreen(unsigned long now) {
+  static bool lastWifiConn = false;
+  static unsigned long homeClockMs = 0;
+  bool conn = (WiFi.status() == WL_CONNECTED);
+  if (conn != lastWifiConn) { lastWifiConn = conn; screenDirty = true; }
+  else if (conn && (now - homeClockMs >= 1000)) {
+    homeClockMs = now;
+    refreshHomeData();
+    if (homeMode != lastHomeModeDrawn) screenDirty = true;
+    else if (homeMode == 1 && !screenDirty) updateHomeClockLines();
+    else if (homeMode == 2 && !screenDirty) {
+      if (homeBmpTemp != lastHomeBmpTemp || homeBmpPress != lastHomeBmpPress) {
+        drawHomeBmpCards(homeBmpTemp, homeBmpPress);
+        lastHomeBmpTemp = homeBmpTemp; lastHomeBmpPress = homeBmpPress;
       }
     }
+  }
+}
+
+// WiFi 页自动刷新：连接/热点/SSID/网页开关变了就重画
+static void tickWifiPage() {
+  static bool lastWifiPageConn = false;
+  static bool lastWifiPageApOn = false;
+  static bool lastWifiPageWeb = false;
+  static String lastWifiPageSsid = "";
+  static String lastWifiPageIp = "";
+  bool conn = (WiFi.status() == WL_CONNECTED);
+  String ssid = conn ? WiFi.SSID() : "";
+  String ipNow = conn ? WiFi.localIP().toString() : (wifiApOn ? WiFi.softAPIP().toString() : "");
+  if (conn != lastWifiPageConn || wifiApOn != lastWifiPageApOn || webEnabled != lastWifiPageWeb
+      || ssid != lastWifiPageSsid || ipNow != lastWifiPageIp) {
+    lastWifiPageConn = conn;
+    lastWifiPageApOn = wifiApOn;
+    lastWifiPageWeb = webEnabled;
+    lastWifiPageSsid = ssid;
+    lastWifiPageIp = ipNow;
+    screenDirty = true;
+  }
+}
+
+// 传感器结果并入 UI：显示串只在 appTask 里生成（String 不能跨任务裸写）。
+// 首页未联网模式（mode 0）只刷底部温压卡；时钟/同步中模式由 tickHomeScreen 的
+// 每秒局部刷新统一处理。
+static void tickSensorUi() {
+  if (!sensorUpdated) return;
+  sensorUpdated = false;
+  String oldT = homeBmpTemp, oldP = homeBmpPress;
+  refreshBmpStrings();
+  if (state == ST_HOME && homeMode == 0) {
+    if (homeBmpTemp != oldT || homeBmpPress != oldP) drawHomeBmpCards(homeBmpTemp, homeBmpPress);
+  }
+}
+
+// 把非 UI 任务放到 PSRAM 栈上（r61 稳定性优化）：
+//   内部 RAM 只剩 16KB，反复刷菜单/网页/HomeKit 并发时有 String 分配失败风险；
+//   网络/传感器/农历任务对栈访问速度不敏感，放 PSRAM 可给内部 RAM 腾出 ~23KB。
+// 分配 stackBytes*sizeof(StackType_t) 字节、传 stackBytes：
+//   IDF 语义按字节算栈（用前 stackBytes 字节），vanilla 语义按字算（正好用满缓冲），
+//   两种实现都不会越界。
+static TaskHandle_t createTaskPsram(TaskFunction_t fn, const char *name, uint32_t stackBytes,
+                                    UBaseType_t prio, StaticTask_t *tcb, TaskHandle_t *out) {
+  *out = nullptr;
+  if (psramFound()) {
+    StackType_t *stack = (StackType_t *)heap_caps_malloc(
+        (size_t)stackBytes * sizeof(StackType_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (stack) {
+      TaskHandle_t h = xTaskCreateStatic(fn, name, stackBytes, nullptr, prio, stack, tcb);
+      if (h) {
+        *out = h;
+        return h;
+      }
+      heap_caps_free(stack);
+    }
+  }
+  if (xTaskCreate(fn, name, stackBytes, nullptr, prio, out) != pdPASS) *out = nullptr;
+  return *out;
+}
+
+// UI/状态机任务（原 loop 主体）：独占 TFT、按键、红外收发
+static void appTask(void *) {
+  esp_task_wdt_add(NULL);
+  unsigned long chipLastRefresh = 0;
+  unsigned long tasksLastRefresh = 0;
+  unsigned long radioLastPoll = 0;
+  for (;;) {
+    esp_task_wdt_reset();
+    unsigned long now = millis();
+
+    // UI 任务心跳（10 秒）：即使 netTask 创建失败也能从串口确认 UI 存活与内存余量
+    static unsigned long lastAppStat = 0;
+    if (lastAppStat == 0 || now - lastAppStat >= 10000) {
+      lastAppStat = now;
+      Serial.printf("[APP] up=%lus int=%uKB psram=%uKB min=%uKB maxBlock=%uKB | entry=%u sync=%u tft=%u KB | net=%d\n",
+                    (unsigned long)(now / 1000),
+                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                    (unsigned)(ESP.getMinFreeHeap() / 1024),
+                    (unsigned)(ESP.getMaxAllocHeap() / 1024),
+                    (unsigned)(dbgMemEntry / 1024), (unsigned)(dbgMemSync / 1024), (unsigned)(dbgMemTft / 1024),
+                    netTaskHandle != NULL);
+    }
+
+    // 1. 首页
+    if (state == ST_HOME) tickHomeScreen(now);
+
+    // 1b. WiFi 页
+    if (state == ST_WIFI) tickWifiPage();
+
+    // 1c. 网页改动的异步刷新（配对码/复制编号名）
+    if (pairCodeDirty) {
+      pairCodeDirty = false;
+      if (state == ST_HS) screenDirty = true;
+    }
+    if (copyNameDirty) {
+      copyNameDirty = false;
+      if (state == ST_COPY) { refreshCopyLines(); screenDirty = true; }
+    }
+    if (devNameDirty) {  // 网页改了首屏名称：在首页时立即重画
+      devNameDirty = false;
+      if (state == ST_HOME) screenDirty = true;
+    }
+
+    // 1d. 传感器 UI
+    tickSensorUi();
+
+    // 1e. 芯片详情页：每 1 秒只刷卡片内容（不清屏不重画标题，免闪）
+    if (state == ST_CHIP && (chipLastRefresh == 0 || now - chipLastRefresh >= 1000)) {
+      chipLastRefresh = now;
+      refreshChipCard();
+    }
+
+    // 1f. 任务详情页：每 1 秒采集并局部刷新（状态/优先级/CPU/栈余）
+    if (state == ST_TASKS && (tasksLastRefresh == 0 || now - tasksLastRefresh >= 1000)) {
+      tasksLastRefresh = now;
+      refreshTaskRows();
+      drawTasksCard(taskRows, taskRowCount, tasksTop, tasksCpu);
+      static unsigned long tasksLogMs = 0;
+      if (now - tasksLogMs >= 5000) {  // 页内 5 秒一行串口摘要，便于确认统计正常
+        tasksLogMs = now;
+        Serial.printf("[TASKS] n=%u cpu=%u%% heap=%uKB top=%u\n",
+                      taskRowCount, tasksCpu, (unsigned)tasksHeapK, tasksTop);
+      }
+    }
+
+    // 1g. 收音机：自动搜台状态机；收音机页每 1 秒读一次信号
+    if (radioScanning) radioScanTick(now);
+    if (state == ST_RADIO && !radioScanning &&
+        (radioLastPoll == 0 || now - radioLastPoll >= 1000)) {
+      radioLastPoll = now;
+      if (radioPresent && radioPollStatus()) radioRedrawStatus();
+    }
+
+    // 1h. 收音机页底部信号条模拟律动：未静音/未搜台时每 120ms 轻微起伏
+    if (state == ST_RADIO && radioPresent && !radioScanning && !radioMuted) {
+      static unsigned long radioAnimMs = 0;
+      if (now - radioAnimMs >= 120) {
+        radioAnimMs = now;
+        radioDrawBars(radioSignal, radioMuted, radioScanning, radioScanFreq, radioPresent);
+      }
+    }
+
+    // 2. 按键扫描（含 30ms 消抖）
+    pollKeys(now);
+
+    // 2a. 网页注入的按键（调试/自动化测试）：走与物理按键相同的入口（含唤醒）
+    uint8_t injectedKey;
+    while (keyCmdQueue && xQueueReceive(keyCmdQueue, &injectedKey, 0) == pdPASS) {
+      if (injectedKey < 4) handleKeyEvent(injectedKey, now);
+    }
+    if (forceSleep) {
+      forceSleep = false;
+      lastKeyMs = now - SCREEN_SLEEP_MS - 100;  // 下一轮进入熄屏
+    }
+
+#if AUTO_KEY_STRESS
+    // 开机前 30 秒反复"进菜单/滚动/回首页"，覆盖 WiFi/HomeSpan/农历启动并发窗口
+    static unsigned long stressNext = 0;
+    static uint8_t stressStep = 0;
+    if (now < 30000 && now >= stressNext) {
+      stressNext = now + 120;
+      static const uint8_t seq[] = {3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0};
+      handleKeyEvent(seq[stressStep % (sizeof(seq) / sizeof(seq[0]))], now);
+      stressStep++;
+    }
+#endif
+
+    // 2b. 熄屏：3 分钟无按键 -> 背光灭（面板内容保留在 GRAM，唤醒即恢复）
+    if (!screenAsleep && (now - lastKeyMs >= SCREEN_SLEEP_MS)) {
+      digitalWrite(TFT_BL, BL_OFF);
+      screenAsleep = true;
+      // 呼吸灯：两路 LED 改走硬件 PWM（LEDC 5kHz 8 位；拉低点亮，占空比取反）
+      ledcAttach(LED1, 5000, 8);
+      ledcAttach(LED2, 5000, 8);
+      breathT0 = now;
+      lastBreathMs = now;
+      ledcWrite(LED1, 255);
+      ledcWrite(LED2, 255);
+    }
+
+    // 2c. 熄屏呼吸灯：正弦淡入淡出，周期 2s，20ms 写一次寄存器
+    if (screenAsleep && (now - lastBreathMs >= 20)) {
+      lastBreathMs = now;
+      float phase = ((now - breathT0) % 2000) / 2000.0f * 2.0f * PI;
+      uint8_t brightness = (uint8_t)((1.0f - cosf(phase)) * 127.5f);
+      uint8_t duty = 255 - brightness;  // 拉低点亮：亮度取反才是 LEDC 占空比
+      ledcWrite(LED1, duty);
+      ledcWrite(LED2, duty);
+    }
+
+    // 3. 红外测试：运行中时按 3 秒亮 / 3 秒灭循环发 38kHz 载波
+    if (state == ST_IRTEST && irTestRunning) {
+      if (now - irTestPhaseMs >= 3000) {
+        irTestPhaseMs = now;
+        irTestOnPhase = !irTestOnPhase;
+        screenDirty = true;
+      }
+      if (irTestOnPhase) irsend.sendRaw(irTestMark, 2, 38);  // 20ms 载波突发
+    }
+
+    // 4. 红外接收：更新解码显示，串口打印完整解码（含原始数组）
+    if (irrecv.decode(&irResults)) {
+      irRxProto = typeToString(irResults.decode_type, irResults.repeat);
+      irRxHex = hexPad((uint32_t)irResults.value, irResults.bits);
+      if (irResults.repeat) irRxHex += "(R)";
+      recvBits = irResults.bits;
+      recvLen = irResults.rawlen - 1;
+      lastRecv = lookupRecvName((uint32_t)irResults.value, irRxHex);
+      Serial.println("----- 红外接收 -----");
+      Serial.print("协议: ");
+      Serial.println(irRxProto);
+      Serial.print("数值: ");
+      Serial.println(irRxHex);
+      Serial.print("位数: ");
+      Serial.print(recvBits);
+      Serial.println(" Bits");
+      if (irResults.repeat) Serial.println("重复码: 是");
+      // 原始数组：跳过 rawbuf[0] 的起始空闲，单位 50us，换算成微秒打印
+      Serial.print("原始数组 (");
+      Serial.print(recvLen);
+      Serial.println("项):");
+      Serial.print("uint16_t rawData[");
+      Serial.print(recvLen);
+      Serial.print("] = {");
+      for (uint16_t k = 0; k < recvLen; k++) {
+        Serial.print(irResults.rawbuf[k + 1] * 50);
+        if (k + 1 < recvLen) Serial.print(", ");
+      }
+      Serial.println("};");
+      irrecv.resume();
+      if (state == ST_LAMP) {
+        updateRecvLine(lastRecv);
+      } else if (state == ST_AC) {
+        updateAcRecvLine(lastRecv);
+      } else if (state == ST_DECODE) {
+        screenDirty = true;
+      }
+      // 红外复制学习中：解析到的键码存为待存储捕获（连发的重复码同值，覆盖无害）
+      if (state == ST_COPY && copyLearning) {
+        copyCapProto = irRxProto;
+        copyCapValue = irResults.value;
+        copyCapBits = (uint8_t)irResults.bits;
+        copyHasCapture = true;
+        copyStatus = "已解析 按 KEY1 存储";
+        refreshCopyLines();
+        screenDirty = true;
+      }
+    }
+
+    // 4.5 网页/HomeKit 登记的红外：本任务统一执行（与按键同一上下文）
+    execPendingIr();
+
+    // 5. 屏幕刷新
+    if (screenDirty) {
+      drawScreen();
+      screenDirty = false;
+    }
+
+    // 让出 CPU：5ms 轮询足够跟上按键/红外，也避免单核空转饿死网络任务
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+// 网络任务：WiFi 状态、WebServer、HomeSpan、家庭温度推送、异步配网监视。
+// 全部网络相关操作与 appTask 的按键操作用 wifiMutex 串行化。
+static void netTask(void *) {
+  esp_task_wdt_add(NULL);
+  unsigned long apStopAt = 0;
+  uint8_t evt;
+  TempUpdate tu;
+  for (;;) {
+    esp_task_wdt_reset();
+
+    if (wifiMutex && xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      // HomeSpan：WiFi 稳定连接 3 秒后再启动（只启动一次）。避免刚连上时的
+      //   抖动/重连与 HomeSpan 自己的 WiFi 管理撞车（r61 实测会有一次假连接）。
+      static unsigned long wifiStableSince = 0;
+      if (!hsStarted) {
+        if (WiFi.status() == WL_CONNECTED) {
+          if (wifiStableSince == 0) {
+            wifiStableSince = millis();
+          } else if (millis() - wifiStableSince >= 3000) {
+            setupHomeSpan();
+            hsStarted = true;
+            wifiStableSince = 0;
+            // 启动即推一次两个温度的当前值（家庭里不先显示 0）
+            if (bmpPresent && bmpTempChar) bmpTempChar->setVal(bmpTempTenths / 10.0f);
+            if (chipTempChar && chipTempOk && chipTempReadOk) chipTempChar->setVal(chipTempC);
+            Serial.println("HomeKit 已启动（配对码 " + fmtPairCode(getPairCode()) + "，配件：灯、空调、温度、芯片温度）");
+          }
+        } else {
+          wifiStableSince = 0;
+        }
+      }
+      if (hsStarted) homeSpan.poll();
+      if (webEnabled && (wifiApOn || WiFi.status() == WL_CONNECTED)) {
+        wifiServer.handleClient();
+      }
+      xSemaphoreGive(wifiMutex);
+    }
+
+    // HomeKit 瞬时按键弹回：红外发完后由本任务 setVal(0)（与 poll 同任务）
+    while (hsEvtQueue && xQueueReceive(hsEvtQueue, &evt, 0) == pdPASS) {
+      if (evt == HS_EVT_IR_SENT && pendingRevert) {
+        pendingRevert->setVal(0);
+        pendingRevert = nullptr;
+      }
+    }
+
+    // 传感器温度 -> 家庭（每 1 秒一帧，无变化阈值；未启动 HomeSpan 时丢弃）
+    while (tempQueue && xQueueReceive(tempQueue, &tu, 0) == pdPASS) {
+      if (hsStarted) {
+        if (bmpTempChar && tu.bmpValid) bmpTempChar->setVal(tu.bmpC);
+        if (chipTempChar && tu.chipValid) chipTempChar->setVal(tu.chipC);
+      }
+    }
+
+    // 异步配网结果监视：成功 -> 1.5s 后关热点（让结果页发完）；超时 -> 保留热点
+    if (wifiConnecting) {
+      unsigned long elapsed = millis() - wifiConnectStart;
+      if (elapsed > 300 && WiFi.status() == WL_CONNECTED) {  // 300ms 后看，避开旧连接状态
+        wifiConnecting = false;
+        Serial.println("WiFi: 连接成功 IP=" + WiFi.localIP().toString());
+        if (wifiApOn) apStopAt = millis() + 1500;
+      } else if (elapsed > 15000) {
+        wifiConnecting = false;
+        Serial.println("WiFi: 连接超时（配置热点保留，可重试）");
+      }
+    }
+    if (apStopAt && (long)(millis() - apStopAt) >= 0) {
+      apStopAt = 0;
+      wifiStopAp();
+    }
+
+    // 运行状态心跳（r61）：10 秒一行，便于串口确认任务存活、观察堆与栈余量
+    static unsigned long lastStatMs = 0;
+    if (lastStatMs == 0 || millis() - lastStatMs >= 10000) {
+      lastStatMs = millis();
+      Serial.printf("[STAT] up=%lus int=%uKB psram=%uKB stackFree app=%u net=%u sensor=%u B\n",
+                    (unsigned long)(millis() / 1000),
+                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                    (unsigned)(appTaskHandle ? uxTaskGetStackHighWaterMark(appTaskHandle) : 0),
+                    (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                    (unsigned)(sensorTaskHandle ? uxTaskGetStackHighWaterMark(sensorTaskHandle) : 0));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+// 传感器任务：BMP085 + 芯片内核温度每秒采样一次（I2C 总线与寻址互斥）
+static void sensorTask(void *) {
+  esp_task_wdt_add(NULL);
+  TickType_t lastWake = xTaskGetTickCount();
+  for (;;) {
+    esp_task_wdt_reset();
+    if (i2cMutex && xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+      bmpRead();  // 未连接时每次重初始化，支持热插拔
+      xSemaphoreGive(i2cMutex);
+    }
+    bool chipValid = false;
+    if (chipTempOk) {
+      float ct = 0;
+      if (temperature_sensor_get_celsius(chipTempHandle, &ct) == ESP_OK) {
+        chipTempC = ct;
+        chipTempReadOk = true;
+        chipValid = true;
+      }
+    }
+    TempUpdate tu = { bmpPresent, bmpTempTenths / 10.0f, chipValid, chipTempC };
+    if (tempQueue) xQueueOverwrite(tempQueue, &tu);  // 长度 1：只保最新帧
+    sensorUpdated = true;
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(1000));
   }
 }
 
@@ -1742,6 +2976,31 @@ void setup() {
   Serial.begin(115200);
   unsigned long t0 = millis();
   while (!Serial && (millis() - t0 < 2000)) delay(10);  // 等 native USB，最多 2s
+  dbgMemEntry = ESP.getFreeHeap();
+  gResetReason = fmtResetReason();
+  Serial.printf("[BOOT] reset_reason=%d（3=软复位 4=Panic 6=任务看门狗 9=欠压）\n", (int)esp_reset_reason());
+  Serial.printf("[MEM] 0 entry: free=%uKB size=%uKB min=%uKB psram=%uKB\n",
+                (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024),
+                (unsigned)(ESP.getMinFreeHeap() / 1024), (unsigned)(ESP.getPsramSize() / 1024));
+  if (!psramFound()) {
+    Serial.println("警告: PSRAM 未启用！请在 工具>PSRAM 选 Enabled（否则内部堆只剩几 KB，网络功能会失败）");
+  }
+
+  // 跨任务同步对象先建好，后面任何任务/回调都能安全使用
+  stateMutex = xSemaphoreCreateMutex();
+  wifiMutex  = xSemaphoreCreateMutex();
+  i2cMutex   = xSemaphoreCreateMutex();
+  irReqMutex = xSemaphoreCreateMutex();
+  irReqQueue = xQueueCreate(PENDING_QUEUE_LEN, sizeof(PendingItem));
+  tempQueue  = xQueueCreate(1, sizeof(TempUpdate));
+  hsEvtQueue = xQueueCreate(4, sizeof(uint8_t));
+  keyCmdQueue = xQueueCreate(8, sizeof(uint8_t));
+  if (!stateMutex || !wifiMutex || !i2cMutex || !irReqMutex || !irReqQueue || !tempQueue || !hsEvtQueue || !keyCmdQueue) {
+    Serial.println("FreeRTOS 同步对象创建失败，功能可能不完整");
+  }
+  dbgMemSync = ESP.getFreeHeap();
+  Serial.printf("[MEM] 1 sync: free=%uKB size=%uKB\n",
+                (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024));
 
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, BL_ON);
@@ -1759,13 +3018,15 @@ void setup() {
   bootAnimation();      // 开机动画约 2s（此时 WiFi/HomeSpan 还没初始化，屏不黑着等）
   drawScreen();
   screenDirty = false;
+  dbgMemTft = ESP.getFreeHeap();
+  Serial.printf("[MEM] 2 tft: free=%uKB size=%uKB\n",
+                (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024));
 
-  irrecv.enableIRIn();   // RMT 接收，IO16，缓存 512 项
+  enableIrReceiver();    // RMT 接收，IO16，缓存 512 项（定时器只申请一次）
   irsend.begin();        // RMT 发送，IO17
 
   // 芯片内核温度传感器（ESP32-S2 内置 TSENS）：量程 -10~80°C（误差 <1°C 的一档；
-  // 芯片开 WiFi 时内核温度常在 50~60°C，量程不能选小）。装不上时 chipTempOk=false，
-  // 家庭芯片温度瓷砖停在 0（看串口报错定位）。
+  // 芯片开 WiFi 时内核温度常在 50~60°C，量程不能选小）。装不上时 chipTempOk=false。
   {
     temperature_sensor_config_t chipCfg = {};
     chipCfg.range_min = -10;
@@ -1779,67 +3040,51 @@ void setup() {
     }
   }
 
+  Serial.printf("[MEM] 3 ir/tsens: free=%uKB size=%uKB\n",
+                (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024));
+
   Serial.println();
-  Serial.println("===== ESP32-S2 mini 硬件测试启动（r24 菜单版）=====");
+  Serial.println("===== ESP32-S2 mini 硬件测试启动（r61 FreeRTOS 版）=====");
+  Serial.println("任务：appTask(UI/按键/红外) / netTask(WiFi/网页/HomeKit) / sensorTask(BMP085+芯片温度) / lunarTask(农历)");
   Serial.println("首页：WiFi 已连显示时钟，未连显示 Esp32-IR，KEY4 进入一级菜单");
-  Serial.println("一级菜单：灯 / 空调 / 红外解码 / 红外测试 / WiFi设置 / I2C寻址 / 红外复制 / HomeSpan / 关于 / 返回");
   Serial.println("按键：KEY4 菜单，KEY2 加（下一项），KEY3 减（上一项），KEY1 确认");
-  Serial.println("灯：KEY2/KEY3 选码，KEY1 发送 NEC 码");
-  Serial.println("空调：15 项滚动（状态控制 + 屏显/摆风/强劲/模式固定码，熟睡待补）");
-  Serial.println("WiFi设置：KEY1 开关网页，KEY2 开关配置热点（ESP32S2-Setup），网页 192.168.4.1:8080（控制+WiFi配置同页）");
-  Serial.println("红外测试：KEY1 开始/暂停 3 秒亮 3 秒灭，KEY4 返回");
+  Serial.println("WiFi设置：KEY1 开关网页，KEY2 开关配置热点（ESP32S2-Setup），网页 192.168.4.1:8080");
   Serial.println("=====================================");
 
-  // WiFi：读 NVS 里保存的网络，有则后台自动连接（不阻塞启动）
+  // 启动前先把 NVS 数据读完（任务里会用到配对码/复制编号/显示设置）
   wifiPrefs.begin("wifi", false);
   wifiSavedSsid = wifiPrefs.getString("ssid", "");
   wifiSavedPass = wifiPrefs.getString("pass", "");
+  copyLoadAll();                 // 红外复制 10 个编号的键码与名称
+  loadPairCode();                // HomeSpan 配对码（无保存时默认 46637726）
+  loadDeviceName();              // 首屏设备名称（无保存时默认 ESP32-S2-IR）
+  loadDisplaySettings();         // 显示设置掩码（无保存时默认 31 全显示）
+  radioLoadStations();           // 收音机保存的频道（NVS radio）
+  gBuildTime = fmtBuildTime();   // 关于页显示用（开机时算一次）
+  lastKeyMs = millis();          // 熄屏计时从开机完成起算
+  radioInit();                   // TEA5767 探测 + 开机静音（在任务启动前，避免抢 I2C）
+  screenDirty = true;            // NVS 读完重画一次，应用保存的设备名/显示设置
+
+  // 网页路由（在任务启动前注册好，WiFi 连上后 netTask 直接服务）
   wifiServer.on("/", wifiHandleRoot);
   wifiServer.on("/wifi", wifiHandleWifi);
   wifiServer.on("/ir", wifiHandleIr);
   wifiServer.on("/save", HTTP_POST, wifiHandleSave);
   wifiServer.on("/ircopy_name", HTTP_POST, wifiHandleCopyName);
+  wifiServer.on("/devname", HTTP_POST, wifiHandleDevName);
   wifiServer.on("/paircode", HTTP_POST, wifiHandlePairCode);
+  wifiServer.on("/key", wifiHandleKey);     // 调试：网页注入 KEY1~KEY4
+  wifiServer.on("/sleep", wifiHandleSleep); // 调试：强制熄屏
+  wifiServer.on("/radiodbg", wifiHandleRadioDbg);     // 调试：收音机状态/NVS
+  wifiServer.on("/radioclear", wifiHandleRadioClear); // 调试：清空收音机频道
   wifiServer.onNotFound(wifiHandleRoot);
-  if (wifiSavedSsid.length()) {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(wifiSavedSsid.c_str(), wifiSavedPass.c_str());
-    Serial.println("WiFi: 已保存 " + wifiSavedSsid + "，后台连接中");
-  } else {
-    Serial.println("WiFi: 无保存的网络（进 WiFi设置 页配置）");
-  }
 
   // NTP：北京时间（UTC+8，无夏令时），联网后后台自动同步，首页时钟用
   configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org", "time.google.com");
 
-  // 农历拉取任务：HTTPS 放独立栈里跑（见 pollLunarAsync 上方注释）
-  lunarMutex = xSemaphoreCreateMutex();
-  if (lunarMutex) {
-    if (xTaskCreate(lunarFetchTask, "lunarFetch", LUNAR_TASK_STACK, NULL, 1, &lunarTaskHandle) != pdPASS) {
-      lunarTaskHandle = NULL;
-      Serial.println("农历拉取任务创建失败（首页农历将不显示）");
-    }
-  } else {
-    Serial.println("农历互斥锁创建失败（首页农历将不显示）");
-  }
-
-  // 红外复制：开机从 NVS 读入 10 个编号的键码与名称
-  copyLoadAll();
-
-  // HomeSpan 配对码：开机从 NVS 读入（无保存时用默认 46637726）
-  loadPairCode();
-
-  // 显示设置掩码：开机从 NVS 读入（无保存时默认 31 全显示）
-  loadDisplaySettings();
-  gBuildTime = fmtBuildTime();  // 关于页显示用（开机时算一次，不用每次进关于页重算）
-
-  lastKeyMs = millis();  // 熄屏计时从开机完成起算
-
-  // 任务看门狗（r56）：loop 卡死超 10 秒自动重启，不再永久死机；开机初始化慢，
-  //   故在 setup 末尾才启用（WiFi 等待循环里另有喂狗，见 wifiHandleSave）。
-  // 注意：Arduino 核心在启动时已按 IDF 默认（5 秒、panic）初始化过看门狗，
-  //   esp_task_wdt_init 此时返回 ESP_ERR_INVALID_STATE 且不会改超时；必须 reconfigure，
-  //   否则 loop 任务会被挂到 5 秒看门狗上，网络稍有阻塞就复位（上电随机重启的原因之一）。
+  // 任务看门狗（10 秒、panic）：各业务任务自己喂狗，卡死自动重启。
+  // 注意：Arduino 核心启动时已按 IDF 默认（5 秒、panic）初始化过看门狗，
+  //   esp_task_wdt_init 此时返回 ESP_ERR_INVALID_STATE 且不会改超时；必须 reconfigure。
   {
     esp_task_wdt_config_t wdtCfg = {
       .timeout_ms = 10000,
@@ -1848,220 +3093,63 @@ void setup() {
     };
     esp_err_t wdtErr = esp_task_wdt_init(&wdtCfg);
     if (wdtErr == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdtCfg);
-    esp_task_wdt_add(NULL);      // 当前任务即 loop 任务；若已加入则返回失败，可忽略
   }
+
+  // 业务任务必须在 WiFi.begin 之前创建（r61 实测：WiFi/lwIP 先吃掉堆后，
+  //   16KB 任务的连续内存申请会失败，netTask/sensorTask 直接创建不出来）。
+  //   ESP32-S2 单核：不绑核，按优先级调度。栈用字节数。
+  Serial.printf("[MEM] 4 nvs/wdt: free=%uKB size=%uKB min=%uKB | history entry=%uKB sync=%uKB tft=%uKB\n",
+                (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024),
+                (unsigned)(ESP.getMinFreeHeap() / 1024),
+                (unsigned)(dbgMemEntry / 1024), (unsigned)(dbgMemSync / 1024), (unsigned)(dbgMemTft / 1024));
+  Serial.printf("[TASK] 创建前 heap=%uKB maxBlock=%uKB\n",
+                (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024));
+  // UI 任务留在内部 RAM（12KB，反复刷菜单/红外收发响应快）；
+  // net/sensor 任务放 PSRAM，给内部堆腾空间（HomeKit/网页/String 都吃内部堆）。
+  if (xTaskCreate(appTask, "appTask", 12288, NULL, 3, &appTaskHandle) != pdPASS) {
+    Serial.printf("appTask 创建失败 heap=%uKB maxBlock=%uKB\n",
+                  (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024));
+  }
+  if (xTaskCreate(netTask, "netTask", 12288, NULL, 2, &netTaskHandle) != pdPASS) {
+    Serial.printf("netTask 创建失败 heap=%uKB maxBlock=%uKB\n",
+                  (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024));
+  }
+  if (xTaskCreate(sensorTask, "sensorTask", 4096, NULL, 1, &sensorTaskHandle) != pdPASS) {
+    Serial.printf("sensorTask 创建失败 heap=%uKB maxBlock=%uKB\n",
+                  (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024));
+  }
+  Serial.printf("[TASK] 创建后 heap=%uKB maxBlock=%uKB（app=%d net=%d sensor=%d）\n",
+                (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024),
+                appTaskHandle != NULL, netTaskHandle != NULL, sensorTaskHandle != NULL);
+
+  // 开机就起 8080 网页监听：STA 模式（家里 WiFi）也能直接访问，不必先开热点
+  if (wifiMutex) xSemaphoreTake(wifiMutex, portMAX_DELAY);
+  ensureWebServer();
+  if (wifiMutex) xSemaphoreGive(wifiMutex);
+
+  // WiFi：读 NVS 里保存的网络，有则后台自动连接（不阻塞启动）
+  WiFi.setAutoReconnect(true);  // 掉线后自动重连（r61，网页新配的网同样生效）
+  if (wifiSavedSsid.length()) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSavedSsid.c_str(), wifiSavedPass.c_str());
+    Serial.println("WiFi: 已保存 " + wifiSavedSsid + "，后台连接中");
+  } else {
+    Serial.println("WiFi: 无保存的网络（进 WiFi设置 页配置）");
+  }
+
+  // 农历拉取任务：HTTPS 放独立栈里跑（见 pollLunarAsync 上方注释）；栈放 PSRAM
+  lunarMutex = xSemaphoreCreateMutex();
+  if (lunarMutex) {
+    if (!createTaskPsram(lunarFetchTask, "lunarFetch", LUNAR_TASK_STACK, 1, &lunarTaskBuf, &lunarTaskHandle)) {
+      Serial.println("农历拉取任务创建失败（首页农历将不显示）");
+    }
+  } else {
+    Serial.println("农历互斥锁创建失败（首页农历将不显示）");
+  }
+  Serial.println("初始化完成：业务任务已启动（appTask/netTask/sensorTask）");
 }
 
+// Arduino 主循环只保持空转：全部业务在独立任务里，避免 loopTask 抢占栈和优先级。
 void loop() {
-  unsigned long now = millis();
-  esp_task_wdt_reset();  // r56：每轮喂狗，loop 卡死超 10 秒由看门狗重启
-
-  // 1. 首页：联网/断网切换、模式变化时全屏重画；同模式下每秒只刷变化的
-  //    行/卡（不全屏）：时钟模式走 updateHomeClockLines，同步中只刷温压卡；
-  //    未联网模式的 BMP 由 1c 局部刷卡。r44 整屏重画卡片慢是首页一顿一顿的原因。
-  if (state == ST_HOME) {
-    static bool lastWifiConn = false;
-    bool conn = (WiFi.status() == WL_CONNECTED);
-    if (conn != lastWifiConn) { lastWifiConn = conn; screenDirty = true; }
-    else if (conn && (now - homeClockMs >= 1000)) {
-      homeClockMs = now;
-      refreshHomeData();
-      if (homeMode != lastHomeModeDrawn) screenDirty = true;
-      else if (homeMode == 1 && !screenDirty) updateHomeClockLines();
-      else if (homeMode == 2 && !screenDirty) {
-        // 同步中：只刷变化的温压卡，不整屏
-        if (homeBmpTemp != lastHomeBmpTemp || homeBmpPress != lastHomeBmpPress) {
-          drawHomeBmpCards(homeBmpTemp, homeBmpPress);
-          lastHomeBmpTemp = homeBmpTemp; lastHomeBmpPress = homeBmpPress;
-        }
-      }
-    }
-  }
-
-  // 1b. WiFi 页：连接/热点/SSID 变了就重画（配网成功后 STA 连上、或掉线重连时，
-  //     屏上状态自己跟上，不用 KEY4 重进才刷新；与首页的 lastWifiConn 同一思路）
-  if (state == ST_WIFI) {
-    static bool lastWifiPageConn = false;
-    static bool lastWifiPageApOn = false;
-    static String lastWifiPageSsid = "";
-    static String lastWifiPageIp = "";
-    bool conn = (WiFi.status() == WL_CONNECTED);
-    String ssid = conn ? WiFi.SSID() : "";
-    String ipNow = conn ? WiFi.localIP().toString() : (wifiApOn ? WiFi.softAPIP().toString() : "");
-    if (conn != lastWifiPageConn || wifiApOn != lastWifiPageApOn || ssid != lastWifiPageSsid || ipNow != lastWifiPageIp) {
-      lastWifiPageConn = conn;
-      lastWifiPageApOn = wifiApOn;
-      lastWifiPageSsid = ssid;
-      lastWifiPageIp = ipNow;
-      screenDirty = true;
-    }
-  }
-
-  // 1c. 传感器：每 1 秒更新一次（BMP085 读一次约 10ms，1 秒分摊可忽略；
-  //     芯片温度读数极快，不另起定时器，同 tick 推）。未连接时每次重初始化（支持热插拔）。
-  //     首页未联网模式（mode 0）时 BMP 变了只刷底部温压卡，不整屏；
-  //     时钟模式走 section 1 的 updateHomeClockLines，同步中走 section 1 的局部刷卡，
-  //     这里不再给首页置 screenDirty（r44 整屏重画是首页一顿一顿的原因）。
-  if (bmpLastRead == 0 || now - bmpLastRead >= 1000) {
-    bmpLastRead = now;
-    bmpRead();
-    // 家庭温度推送：每 1 秒推一次当前值（无变化阈值）；BMP 温度与芯片温度各推各的。
-    // 气压与 BMP 温度同一次读数，推温度时气压值也已同步刷新（屏上见）。
-    if (bmpPresent && hsStarted && bmpTempChar) {
-      bmpTempChar->setVal(bmpTempTenths / 10.0f);
-    }
-    if (hsStarted && chipTempChar && chipTempOk) {
-      float chipC = 0;
-      if (temperature_sensor_get_celsius(chipTempHandle, &chipC) == ESP_OK) {
-        chipTempChar->setVal(chipC);
-      }
-    }
-    if (state == ST_HOME && homeMode == 0) {
-      String oldT = homeBmpTemp, oldP = homeBmpPress;
-      refreshBmpStrings();
-      if (homeBmpTemp != oldT || homeBmpPress != oldP) drawHomeBmpCards(homeBmpTemp, homeBmpPress);
-    }
-  }
-
-  // 1d. 芯片详情页：每 1 秒只刷卡片内容（RAM/ROM/温度是实时值，不清屏不重画标题，免闪）
-  if (state == ST_CHIP && (chipLastRefresh == 0 || now - chipLastRefresh >= 1000)) {
-    chipLastRefresh = now;
-    refreshChipCard();
-  }
-
-  // 2. 按键扫描（含 30ms 消抖）
-  pollKeys(now);
-
-  // 2b. 熄屏：3 分钟无按键 -> 背光灭（面板内容保留在 GRAM，唤醒即恢复；
-  //      唤醒时 pollKeys 会置 screenDirty 整屏重画兜底，显示一定是最新的）
-  if (!screenAsleep && (now - lastKeyMs >= SCREEN_SLEEP_MS)) {
-    digitalWrite(TFT_BL, BL_OFF);
-    screenAsleep = true;
-    // 呼吸灯：两路 LED 改走硬件 PWM（LEDC 5kHz 8 位；LED 拉低点亮，占空比取反，
-    //   255=常 HIGH=灭，0=常 LOW=最亮），从灭开始淡入，无上电闪烁
-    ledcAttach(LED1, 5000, 8);
-    ledcAttach(LED2, 5000, 8);
-    breathT0 = now;
-    lastBreathMs = now;
-    ledcWrite(LED1, 255);
-    ledcWrite(LED2, 255);
-  }
-
-  // 2c. 熄屏呼吸灯：正弦淡入淡出，周期 2s（0s 灭 -> 1s 最亮 -> 2s 灭），两灯同步；
-  //      亮度由绝对时间算出（不依赖 loop 速率），20ms 写一次寄存器足够平滑
-  if (screenAsleep && (now - lastBreathMs >= 20)) {
-    lastBreathMs = now;
-    float phase = ((now - breathT0) % 2000) / 2000.0f * 2.0f * PI;
-    uint8_t brightness = (uint8_t)((1.0f - cosf(phase)) * 127.5f);
-    uint8_t duty = 255 - brightness;  // 拉低点亮：亮度取反才是 LEDC 占空比
-    ledcWrite(LED1, duty);
-    ledcWrite(LED2, duty);
-  }
-
-  // 3. 红外测试：运行中时按 3 秒亮 / 3 秒灭循环发 38kHz 载波
-  if (state == ST_IRTEST && irTestRunning) {
-    if (now - irTestPhaseMs >= 3000) {
-      irTestPhaseMs = now;
-      irTestOnPhase = !irTestOnPhase;
-      screenDirty = true;
-    }
-    if (irTestOnPhase) {
-      irsend.sendRaw(irTestMark, 2, 38);  // 20ms 载波突发，循环发送即连续载波
-    }
-  }
-
-  // 4. 红外接收：更新解码显示，串口打印完整解码（含原始数组）
-  if (irrecv.decode(&irResults)) {
-    irRxProto = typeToString(irResults.decode_type, irResults.repeat);
-    irRxHex = hexPad((uint32_t)irResults.value, irResults.bits);
-    if (irResults.repeat) irRxHex += "(R)";
-    recvBits = irResults.bits;
-    recvLen = irResults.rawlen - 1;
-    // 底部解码提示（灯/空调子菜单）：显示解码出的键名，查不到显示数值
-    lastRecv = lookupRecvName((uint32_t)irResults.value, irRxHex);
-    Serial.println("----- 红外接收 -----");
-    Serial.print("协议: ");
-    Serial.println(irRxProto);
-    Serial.print("数值: ");
-    Serial.println(irRxHex);
-    Serial.print("位数: ");
-    Serial.print(recvBits);
-    Serial.println(" Bits");
-    if (irResults.repeat) Serial.println("重复码: 是");
-    // 原始数组：跳过 rawbuf[0] 的起始空闲，单位 50us，换算成微秒打印
-    Serial.print("原始数组 (");
-    Serial.print(recvLen);
-    Serial.println("项):");
-    Serial.print("uint16_t rawData[");
-    Serial.print(recvLen);
-    Serial.print("] = {");
-    for (uint16_t k = 0; k < recvLen; k++) {
-      Serial.print(irResults.rawbuf[k + 1] * 50);
-      if (k + 1 < recvLen) Serial.print(", ");
-    }
-    Serial.println("};");
-    irrecv.resume();
-    // 灯/空调子菜单只刷底部“接收:”行；解码屏多行变化，全屏重画；
-    // 首页不再显示接收，菜单/关于/红外测试不显示接收，都不重画
-    if (state == ST_LAMP) {
-      updateRecvLine(lastRecv);
-    } else if (state == ST_AC) {
-      updateAcRecvLine(lastRecv);
-    } else if (state == ST_DECODE) {
-      screenDirty = true;
-    }
-    // 红外复制学习中：解析到的键码存为待存储捕获（按住遥控器连发的重复码同值，覆盖无害）
-    if (state == ST_COPY && copyLearning) {
-      copyCapProto = irRxProto;
-      copyCapValue = irResults.value;
-      copyCapBits = (uint8_t)irResults.bits;
-      copyHasCapture = true;
-      copyStatus = "已解析 按 KEY1 存储";
-      refreshCopyLines();
-      screenDirty = true;
-    }
-  }
-
-  // 4.5 网页服务：总开关开着、且热点开着或家里 WiFi 连上时才处理请求
-  if (webEnabled && (wifiApOn || WiFi.status() == WL_CONNECTED)) wifiServer.handleClient();
-
-  // 4.6 HomeSpan：WiFi 一连上就启动（只启动一次），启动后每轮 poll
-  if (!hsStarted && WiFi.status() == WL_CONNECTED) {
-    setupHomeSpan();
-    hsStarted = true;
-    // 启动即推一次两个温度的当前值（家庭里不先显示 0）；之后由 1 秒周期推
-    if (bmpPresent && bmpTempChar) bmpTempChar->setVal(bmpTempTenths / 10.0f);
-    if (chipTempChar && chipTempOk) {
-      float chipC = 0;
-      if (temperature_sensor_get_celsius(chipTempHandle, &chipC) == ESP_OK) chipTempChar->setVal(chipC);
-    }
-    Serial.println("HomeKit 已启动（配对码 " + fmtPairCode(curPairCode) + "，配件：灯、空调、温度、芯片温度）");
-  }
-  if (hsStarted) homeSpan.poll();
-
-  // 4.7 网页/HomeKit 登记的红外：本轮统一执行（与按键同一上下文）
-  execPendingIr();
-
-  // 4.8 HomeKit 瞬时按键的弹回：红外发完后再 setVal(0)，不在 update 里做
-  if (pendingRevert) {
-    pendingRevert->setVal(0);
-    pendingRevert = nullptr;
-  }
-
-  // 4.9 HomeKit/网页触发的发送：补刷灯/空调页的发送行与空调状态行
-  if (hsSentDirty) {
-    if (state == ST_LAMP) updateSendLine(lastSent);
-    else if (state == ST_AC) updateAcSendLine(lastSent);
-    hsSentDirty = false;
-  }
-  if (hsAcStateDirty) {
-    if (state == ST_AC) updateAcStatusLine(buildAcStatus());
-    hsAcStateDirty = false;
-  }
-
-  // 5. 屏幕刷新
-  if (screenDirty) {
-    drawScreen();
-    screenDirty = false;
-  }
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
